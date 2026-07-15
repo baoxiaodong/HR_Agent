@@ -1,5 +1,9 @@
 """
-日志配置
+应用日志配置。
+
+``setup_logging`` 在应用启动阶段一次性装配控制台、普通轮转文件和错误轮转文件三个
+输出通道。``SafeStreamHandler`` 专门兜底 Windows 控制台编码问题，避免一条包含特殊
+字符的日志影响业务请求。
 """
 import logging
 import logging.config

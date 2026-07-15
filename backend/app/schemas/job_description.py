@@ -1,5 +1,9 @@
 """
-    职位描述模式，用于API请求/响应验证
+职位描述生成、持久化和列表响应 Schema。
+
+生成请求服务于 Dify 工作流；Create/Update/Response 模型服务于远程 HR 数据接口。
+``JobDescriptionResponse`` 要求包含资源归属和审计字段，领域服务会在远程响应缺字段时从
+原请求补齐后再执行此处的类型校验。
 """
 from typing import Optional, Dict, Any
 from datetime import datetime

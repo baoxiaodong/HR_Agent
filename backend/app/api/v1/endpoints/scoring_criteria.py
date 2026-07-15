@@ -1,9 +1,9 @@
 """
-评分标准管理相关的API接口
-- 创建、更新、删除评分标准记录
-- 保存和管理评分标准内容
-- 查询评分标准列表和详情
-- 数据库操作和持久化
+评分标准管理 API。
+
+端点接收 Pydantic Schema 校验后的数据，把当前用户 ID 一并交给
+``ScoringCriteriaService``，由服务层限定数据归属并执行持久化。接口只负责编排分页、
+筛选参数及异常到状态码的转换；删除采用服务层定义的软删除，不直接移除数据库记录。
 """
 from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -31,8 +31,10 @@ async def save_scoring_criteria(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    保存生成的评分标准到数据库
+    """以认证用户为归属保存一条已生成评分标准。
+
+    端点只接收结构化 Schema；服务层负责远程请求适配、保存响应补全与对外 Schema 转换。
+    未分类的远程或校验异常统一包装为 500。
     """
     try:
         service = ScoringCriteriaService(db)
@@ -53,8 +55,10 @@ async def update_scoring_criteria(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    更新已保存的评分标准
+    """局部更新认证用户范围内的一条评分标准。
+
+    标准 ID、更新 Schema 和用户 ID 一并传给远程服务；未命中或归属不匹配映射为 404，
+    其他远程、结构或网络错误返回 500。
     """
     try:
         service = ScoringCriteriaService(db)
@@ -79,8 +83,10 @@ async def get_scoring_criteria(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    获取单个评分标准详情
+    """在认证用户上下文中读取一条评分标准详情。
+
+    服务层把用户 ID 作为远程资源隔离条件，并将返回数据规范化为响应 Schema；未命中映射
+    为 404，其他失败统一包装为 500。
     """
     try:
         service = ScoringCriteriaService(db)
@@ -107,8 +113,10 @@ async def get_scoring_criteria_list(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    获取评分标准列表
+    """分页列出认证用户的评分标准，可选按关联 JD 收窄。
+
+    Query 先约束分页范围，服务层继续携带用户 ID 和 JD 过滤器访问远程接口，并返回稳定的
+    列表分页结构。
     """
     try:
         service = ScoringCriteriaService(db)
@@ -133,8 +141,10 @@ async def delete_scoring_criteria(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    删除评分标准（软删除）
+    """在认证用户范围内软删除一条评分标准。
+
+    服务层通过远程接口推进删除状态而不物理移除记录；未命中或归属不匹配映射为 404，
+    其他远程错误统一返回 500。
     """
     try:
         service = ScoringCriteriaService(db)

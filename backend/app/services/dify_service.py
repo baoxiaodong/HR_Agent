@@ -1,6 +1,9 @@
 """
-Dify工作流服务
-处理与Dify工作流的集成以实现HR自动化任务
+Dify 工作流 HTTP 适配器。
+
+调用方只提供工作流类型、查询文本和额外输入，本服务负责认证头、请求体、超时与错误
+转换。同步方法返回完整 JSON；流式方法解析 Dify 的 SSE 行，过滤控制帧和心跳后再把
+有效内容交给 API 层转发。
 """
 import json
 import uuid
@@ -12,7 +15,7 @@ from app.core.logging import logger
 
 
 class DifyService:
-    """用于与Dify工作流交互的服务"""
+    """把内部工作流调用适配为 Dify 同步 JSON 或经过过滤的 SSE 数据行。"""
 
     def __init__(self):
         self.base_url = settings.DIFY_BASE_URL
@@ -29,24 +32,19 @@ class DifyService:
         conversation_id: Optional[str] = None,
         additional_inputs: Optional[Dict[str, Any]] = None
     ) -> AsyncGenerator[str, None]:
-        """
-        调用Dify工作流并流式响应
+        """将内部工作流参数转换为 Dify chat-messages 流式请求。
 
-        Args:
-            workflow_type: 工作流类型 (1=JD生成, 2=简历评价, 等)
-            query: 用户查询/提示
-            conversation_id: 可选的对话ID以提供上下文
-            additional_inputs: 额外的输入参数
-
-        Yields:
-            流式响应数据
+        ``workflow_type`` 和附加字段被合并进 ``inputs``，查询放在 ``query``，远程会话 ID 为空
+        时发送空串。方法逐行过滤 SSE 控制帧后产出 JSON 字符串或非 JSON 正文，不把远程事件
+        解释成业务对象；调用方负责提取 answer/delta。超时和网络错误会转换为 HTTPException。
         """
         try:
-            # 准备请求数据
+            # 固定 type 是工作流路由字段；additional_inputs 只补充该工作流需要的业务参数。
             inputs = {"type": workflow_type}
             if additional_inputs:
                 inputs.update(additional_inputs)
 
+            # 这是 Dify 对外协议字典；本地 UUID/Schema 等对象必须在上层先转为 JSON 可序列化值。
             request_data = {
                 "inputs": inputs,
                 "query": query,
@@ -71,6 +69,7 @@ class DifyService:
                     json=request_data
                 ) as response:
 
+                    # 非 200 时先完整读取响应体，便于将远程错误原因返回给上层。
                     if response.status_code != 200:
                         error_text = await response.aread()
                         logger.error(f"Dify API错误: {response.status_code} - {error_text}")
@@ -120,6 +119,8 @@ class DifyService:
             logger.error(f"Dify API请求错误: {str(e)}")
             raise HTTPException(status_code=503, detail=f"Dify API请求错误: {str(e)}")
         except Exception as e:
+            # 该兜底也会捕获上面主动抛出的 HTTPException，并按当前实现重新包装为 500；
+            # 因此最终状态码应以实际抛出的异常为准，不能假设远程非 200 一定原样透传。
             logger.error(f"Dify工作流调用中出现意外错误: {str(e)}")
             raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
 
@@ -130,19 +131,13 @@ class DifyService:
         conversation_id: Optional[str] = None,
         additional_inputs: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """
-        调用Dify工作流并同步响应
+        """以 blocking 模式调用同一 Dify 端点并返回完整 JSON 字典。
 
-        Args:
-            workflow_type: 工作流类型
-            query: 用户查询/提示
-            conversation_id: 可选的对话ID
-            additional_inputs: 额外的输入参数
-
-        Returns:
-            完整的响应数据
+        请求字段与流式版本一致，仅 ``response_mode`` 和超时时间不同；返回 JSON 保留远程自由
+        结构，业务层需继续提取并校验 ``answer/data``。该适配器不保存数据库或会话消息。
         """
         try:
+            # 工作流类型与业务输入统一放入 inputs，避免散落在顶层请求协议。
             inputs = {"type": workflow_type}
             if additional_inputs:
                 inputs.update(additional_inputs)
@@ -186,5 +181,7 @@ class DifyService:
             logger.error(f"Dify API请求错误: {str(e)}")
             raise HTTPException(status_code=503, detail=f"Dify API请求错误: {str(e)}")
         except Exception as e:
+            # 该兜底也会捕获上面主动抛出的 HTTPException，并按当前实现重新包装为 500；
+            # 因此最终状态码应以实际抛出的异常为准，不能假设远程非 200 一定原样透传。
             logger.error(f"Dify工作流调用中出现意外错误: {str(e)}")
             raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")

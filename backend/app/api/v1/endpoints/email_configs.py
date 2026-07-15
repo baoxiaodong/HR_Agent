@@ -1,5 +1,9 @@
 """
-招聘邮箱配置和操作的API端点
+招聘邮箱配置与邮件抓取 API。
+
+所有配置接口仅允许超级用户访问。配置的增删改由 ``EmailConfigService`` 持久化，成功后
+通过 ``request.app.state.email_scheduler`` 刷新或停止对应后台任务；手动抓取和日志查询
+由 ``EmailFetchService`` 完成，读取最新邮件则直接使用 ``EmailReader`` 建立短连接。
 """
 from typing import Any, List
 from fastapi import APIRouter, Depends, HTTPException, status, Request

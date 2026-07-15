@@ -1,5 +1,9 @@
 """
-文本工具函数
+面向搜索、展示和文档摄取的文本转换工具。
+
+清洗与相似度函数采用正则、Unicode 规范化和词集合等轻量规则，适合预处理和启发式排序，
+不能替代 HTML 安全净化器、自然语言分词器或向量模型。文件文本提取会按 MIME 类型选择
+解析库，并以空字符串表示不支持或提取失败，由上层服务决定降级、报错或跳过文档。
 """
 import re
 import html
@@ -31,7 +35,10 @@ def clean_text(text: str) -> str:
 
 
 def remove_html_tags(text: str) -> str:
-    """从文本中移除HTML标签"""
+    """移除 HTML 实体和形似标签的片段，供纯文本预处理使用。
+
+    这里使用正则而非 HTML 解析器，不能作为允许富文本渲染时的 XSS 安全边界。
+    """
     if not text:
         return ""
     
@@ -131,7 +138,12 @@ def split_text_into_chunks(
     chunk_size: int = 1000,
     overlap: int = 100
 ) -> List[str]:
-    """将文本分割成重叠的块"""
+    """按字符上限切成带重叠的块，供检索或模型上下文使用。
+
+    优先在英文句号、感叹号、问号或空格处断开；边界不合适时按字符截断。``overlap``
+    应小于 ``chunk_size``，本函数不负责 token 计数，中文和英文在模型中的 token 数也不等于
+    Python 字符数。
+    """
     if not text:
         return []
 
@@ -283,9 +295,11 @@ def mask_sensitive_data(text: str, mask_char: str = "*") -> str:
 
 
 async def extract_text_content(file_path: str, mime_type: str) -> str:
-    """使用健壮的处理程序从文件路径提取文本内容。
+    """按 MIME 类型从本地文件提取纯文本，失败时返回空字符串。
 
-    这镜像了增强文档服务的提取逻辑，以便可以在知识库摄取和简历筛选之间重用。
+    文本和 Markdown 直接按 UTF-8 读取；PDF 使用 PyPDF2；DOCX 优先 ``docx2txt``，失败后
+    回退到 ``python-docx``，并额外遍历表格单元格。旧版 ``.doc`` 不支持。函数虽为 async，
+    当前解析库和文件 I/O 仍是同步操作，大文件调用可能占用事件循环线程。
     """
     try:
         if mime_type in ('text/plain', 'text/markdown'):

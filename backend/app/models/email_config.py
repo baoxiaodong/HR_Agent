@@ -1,5 +1,9 @@
 """
-    邮箱配置和抓取日志的模型
+招聘邮箱配置与抓取运行日志模型。
+
+``EmailConfig`` 同时保存 IMAP 读取参数、SMTP 发送参数和自动抓取计划；每次抓取产生一条
+``EmailFetchLog``，记录发现邮件数、提取简历数和错误。删除配置时 ORM 级联删除其历史
+日志，后台调度任务则由服务层另行停止。
 """
 from sqlalchemy import Column, String, Integer, Boolean, Text, ForeignKey, DateTime
 from sqlalchemy.dialects.postgresql import UUID

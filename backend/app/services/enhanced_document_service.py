@@ -1,5 +1,8 @@
 """
-增强文档服务，集成LangChain进行文档处理和向量化
+增强文档处理与检索服务。
+
+负责语义切分、文件上传与文本提取、PGVector 块写入、语义/文本检索，以及文档查询和删除。
+文件系统、业务表和向量表并非始终由同一个事务覆盖，需要显式识别部分成功状态。
 """
 import logging
 import os
@@ -32,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 class EnhancedDocumentService(BaseDocumentService):
-    """增强文档管理服务，集成LangChain功能"""
+    """编排文档文件、业务记录、文本切分和向量检索。"""
 
     def __init__(self, db: AsyncSession):
         super().__init__(db)
@@ -48,32 +51,44 @@ class EnhancedDocumentService(BaseDocumentService):
 
         logger.info("增强文档服务已使用共享嵌入服务初始化")
 
+    # ---------- 语义切分 ----------
+
     def _split_by_semantic_points(self, text: str, split_points: List[str]) -> List[str]:
-        """根据语义分割点切分文本"""
+        """按模型给出的原文片段位置切分，切分点本身归入后一个文本块。
+
+        分割点必须能在 ``text`` 中找到；不存在或顺序落后的点会被跳过。该函数只负责按位置
+        切片，不处理块长度，后续 ``_split_text`` 会统一执行强制拆分和短块合并。
+        """
         chunks = []
         current_pos = 0
 
-        # 按顺序查找每个分割点并切分文本
+        # 从上一个切分位置向后搜索，避免相同片段导致切分顺序回退。
         for point in split_points:
             pos = text.find(point, current_pos)
             if pos != -1:
-                # 添加当前位置到分割点位置的文本块
+                # 先保存切分点之前的内容，再让下一块从切分点开头开始，保留标题语义。
                 if pos > current_pos:
                     chunk = text[current_pos:pos].strip()
                     if chunk:
                         chunks.append(chunk)
                 current_pos = pos
 
-        # 添加最后一个文本块
+        # 尾部没有下一个分割点，需要作为最后一个完整块保留。
         if current_pos < len(text):
             chunk = text[current_pos:].strip()
             if chunk:
                 chunks.append(chunk)
 
         return chunks
+
     async def get_semantic_split_points(self, content: str) -> List[str]:
+        """让 LLM 提议切分点，再用原文校验、消歧并按真实位置排序。
+
+        模型只看到前 10000 个字符，所以超出窗口的正文不会产生语义切分点；任何调用、响应
+        或校验异常都降级为空列表，由主切分流程改用确定性的长度切分。
+        """
         try:
-            # 通过聊天模型生成分割点，仅返回以 `~~` 分隔的分割点字符串
+            # LLM 只负责给出候选原文片段，不直接生成切分后的内容，避免改写原始文档。
             system_prompt = (
                 "你是一个文档结构分析助手。只输出用于 split 的分割点字符串，"
                 "用`~~`分隔，不要输出任何其他文字。确保每个分割点在原文中唯一，"
@@ -176,11 +191,15 @@ class EnhancedDocumentService(BaseDocumentService):
             return []
 
     def _force_split_long_chunk(self, chunk: str) -> List[str]:
-        """强制分割超长段落（超过1000字符）"""
+        """把超过 1000 字符的块拆成有确定上限的子块。
+
+        优先以换行保持段落边界；单行本身超长时递归进入无换行分支，最终按固定字符数切片。
+        这里按 Python 字符计数，不等同于嵌入模型或 LLM 的 token 数。
+        """
         max_length = 1000
         chunks = []
 
-        # 先尝试按换行符分割
+        # 有自然段落边界时逐行累积，尽量避免在句段中间切断。
         if '\n' in chunk:
             lines = chunk.split('\n')
             current_chunk = ""
@@ -208,7 +227,11 @@ class EnhancedDocumentService(BaseDocumentService):
         return chunks
 
     def _merge_short_chunks(self, chunks: List[str], min_length: int = 50, max_length: int = 1000) -> List[str]:
-        """合并过短片段，避免产生极短段落，同时不超过最大长度"""
+        """向后合并过短块，在减少碎片的同时维持最大字符数约束。
+
+        合并只改变块边界，不改写文本内容；当前块会连续吸收后续块，直到达到最小长度、
+        触及最大长度或没有后续块。
+        """
         if not chunks:
             return []
         merged: List[str] = []
@@ -216,7 +239,7 @@ class EnhancedDocumentService(BaseDocumentService):
         while i < len(chunks):
             cur = chunks[i]
             
-            # 如果当前片段过短且不是最后一个，尝试合并
+            # 短块优先与后继内容合并，避免向量库中出现语义信息不足的独立记录。
             if len(cur) < min_length and i + 1 < len(chunks):
                 # 尝试合并多个连续的短片段
                 merged_chunk = cur
@@ -253,26 +276,32 @@ class EnhancedDocumentService(BaseDocumentService):
         return merged
 
     async def _split_text(self, content: str) -> List[str]:
-        """主分割流程：使用 LLM 分割点 + 切分 + 长度约束"""
-        # 1) 获取分割点（可能为空）
+        """执行“LLM 候选点 -> 原文切片 -> 长块拆分 -> 短块合并”的完整流程。
+
+        LLM 只优化语义边界，不是必需依赖；候选点为空时整篇内容仍会进入确定性的长度约束，
+        因而远程模型失败不会阻断后续向量化。
+        """
+        # 1. 请求语义候选点；异常已在下层转换为空列表。
         points = await self.get_semantic_split_points(content)
-        # 2) 根据分割点切分；若为空则整体作为一个片段
+        # 2. 只用原文中真实存在的点切片，模型不能向文档注入新内容。
         if points:
             chunks = self._split_by_semantic_points(content, points)
         else:
             chunks = [content]
-        # 3) 对超长片段进行强制分割（>1000）
+        # 3. 所有超过 1000 字符的块必须继续拆分，限制单次嵌入输入规模。
         normalized: List[str] = []
         for ch in chunks:
             if len(ch) > 1000:
                 normalized.extend(self._force_split_long_chunk(ch))
             else:
                 normalized.append(ch)
-        # 4) 合并过短片段（<50）
+        # 4. 合并小于 50 字符的碎片，提升每个向量块的上下文完整度。
         normalized = self._merge_short_chunks(normalized, min_length=50, max_length=1000)
-        # 5) 去除空白
+        # 5. 最终只返回非空原文块，作为 PGVector 的 page_content。
         normalized = [c.strip() for c in normalized if c and c.strip()]
         return normalized
+
+    # ---------- 上传与处理 ----------
 
     async def upload_document(
         self,
@@ -282,8 +311,12 @@ class EnhancedDocumentService(BaseDocumentService):
         tags: Optional[List[str]] = None,
         knowledge_base_id: Optional[str] = None
     ) -> Document:
-        """上传并处理文档"""
-        # 如果提供，将knowledge_base_id从字符串转换为UUID
+        """把接口层 ``UploadFile`` 适配为内部文件流参数后进入上传主流程。
+
+        ``user_id`` 应来自认证依赖而不是请求体。知识库 ID 在这里只做格式转换；无效字符串会
+        降级为“未关联知识库”，本方法本身不验证目标知识库是否存在或属于当前用户。
+        """
+        # API 层传入字符串，ORM 字段需要 UUID；无法转换时保留上传但不建立知识库关联。
         kb_id = None
         if knowledge_base_id:
             try:
@@ -292,6 +325,7 @@ class EnhancedDocumentService(BaseDocumentService):
                 logger.warning(f"无效的知识库ID格式: {knowledge_base_id}")
                 kb_id = None
 
+        # 只把 Starlette 上传对象拆为底层流和文件名，实际副作用集中在统一主流程中。
         return await self.upload_and_process_document(
             file=file.file,
             filename=file.filename,
@@ -310,7 +344,11 @@ class EnhancedDocumentService(BaseDocumentService):
         category: Optional[str] = None,
         tags: Optional[List[str]] = None
     ) -> Document:
-        """上传文档（仅保存文件，不进行解析和向量化）"""
+        """保存原文件和 Document 记录，不在此阶段提取文本或写入向量。
+
+        文件先写入磁盘，再提交 Document 记录；提交失败时数据库会话回滚，但已经写入的文件
+        不会清理。哈希命中已有记录时直接返回，不再写文件。
+        """
         try:
             # 读取文件内容
             file_content = file.read()
@@ -328,7 +366,7 @@ class EnhancedDocumentService(BaseDocumentService):
             # 确定MIME类型
             mime_type = self._get_mime_type(filename)
 
-            # 永久保存文件
+            # 先写文件系统；后续数据库失败不会自动删除该文件。
             file_path = await self._save_file(file_content, filename, user_id)
 
             # 创建文档记录（暂不提取内容和向量化）
@@ -359,7 +397,14 @@ class EnhancedDocumentService(BaseDocumentService):
             raise
 
     async def process_document(self, document_id: UUID) -> Document:
-        """处理已上传的文档：提取文本、分块、向量化"""
+        """读取已上传文件，提取文本、切分并写入 PGVector，最后提交文档内容。
+
+        本方法只按 ``document_id`` 查询，不接收用户身份；资源归属校验必须在调用它的端点或
+        上层服务完成。临时文件在 finally 中清理；``extracted_content`` 只在最后一次数据库
+        提交后持久化，没有独立的处理状态字段更新。PGVector 使用独立同步连接，若向量写入
+        已完成而后续 Document 提交失败，外层 ``rollback`` 不会删除这些向量块。
+        """
+        # 这里取得的是 ORM 实体，后续赋值先停留在当前 AsyncSession，直到 commit 才持久化。
         result = await self.db.execute(
             select(Document).where(Document.id == document_id)
         )
@@ -374,13 +419,15 @@ class EnhancedDocumentService(BaseDocumentService):
                 file_content = f.read()
             temp_file_path = await self._save_temp_file(file_content, document.filename)
 
-            # 提取文本内容
+            # 1. 从临时文件提取文本，并先更新当前会话中的 Document 对象。
             extracted_content = await extract_text_content(temp_file_path, document.mime_type)
             document.extracted_content = extracted_content
 
             if extracted_content:
+                # 2. 切分和向量写入先于 Document 提交，且不受当前异步事务统一回滚。
                 await self._create_document_chunks_with_pgvector(document, extracted_content)
 
+            # 3. 最后提交 extracted_content；空文本也会提交当前 Document 状态。
             await self.db.commit()
             await self.db.refresh(document)
             logger.info(f"文档处理成功: {document.id}")
@@ -395,7 +442,12 @@ class EnhancedDocumentService(BaseDocumentService):
                 os.unlink(temp_file_path)
 
     async def _create_document_chunks_with_pgvector(self, document: Document, content: str) -> None:
-        """使用PGVector为嵌入向量创建文档块"""
+        """语义切分文本，生成嵌入并写入用户对应的 PGVector 集合。
+
+        语义分割点来自远程 LLM，失败时 ``_split_text`` 会退回长度切分；块元数据随向量一起
+        通过同步 ``add_documents`` 写入。该写入不使用 ``self.db``，异常向上抛出由调用方
+        处理，但调用方的数据库回滚不能撤销已完成的向量写入。
+        """
         # text_chunks = self.get_semantic_split_points(content)
         text_chunks = await self._split_text(content)
         if not text_chunks:
@@ -451,6 +503,8 @@ class EnhancedDocumentService(BaseDocumentService):
             # 不在这里处理数据库事务，让调用方处理
             raise
 
+    # ---------- 检索 ----------
+
     async def semantic_search(
         self,
         query: str,
@@ -460,7 +514,11 @@ class EnhancedDocumentService(BaseDocumentService):
         category: Optional[str] = None,
         similarity_threshold: float = 0.8
     ) -> List[Dict[str, Any]]:
-        """使用PGVector执行语义搜索"""
+        """在用户块集合中执行向量检索，失败时回退到业务表文本查询。
+
+        可按知识库和分类过滤，并仅保留距离分数不高于阈值的结果。向量连接、嵌入或查询任一
+        环节抛错都会进入 ``_fallback_text_search``；两个分支均为只读，不提交数据库事务。
+        """
         try:
             collection_name = f"document_chunks_{user_id}".replace("-", "_")
             
@@ -515,7 +573,11 @@ class EnhancedDocumentService(BaseDocumentService):
         knowledge_base_id: Optional[UUID] = None,
         category: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """向量搜索失败时的回退文本搜索"""
+        """使用 Document.extracted_content 的 ILIKE 包含查询作为回退。
+
+        返回的是文档级前 500 字预览，并赋固定相似度 0.5，不等同于向量块得分；查询异常
+        被记录后返回空列表，不再向上抛出。
+        """
         try:
             base_query = select(Document).where(Document.user_id == user_id)
             
@@ -551,6 +613,8 @@ class EnhancedDocumentService(BaseDocumentService):
             logger.error(f"回退文本搜索时出错: {e}")
             return []
 
+    # ---------- 查询与删除 ----------
+
     async def get_user_documents(
         self,
         user_id: UUID,
@@ -559,8 +623,13 @@ class EnhancedDocumentService(BaseDocumentService):
         category: Optional[str] = None,
         knowledge_base_id: Optional[UUID] = None
     ) -> List[Document]:
-        """获取用户文档，支持可选过滤"""
+        """读取当前用户可见的文档，并在同一查询中应用分类、知识库和分页条件。
+
+        ``user_id`` 是强制隔离条件，调用方无法通过可选过滤器扩大到其他用户的数据；本方法
+        只返回 ORM 实体，不提交事务，也不加载或生成向量块。
+        """
         try:
+            # 先固定租户边界，再叠加业务过滤，避免遗漏用户隔离条件。
             query = select(Document).where(Document.user_id == user_id)
             
             if category:
@@ -569,6 +638,7 @@ class EnhancedDocumentService(BaseDocumentService):
             if knowledge_base_id:
                 query = query.where(Document.knowledge_base_id == knowledge_base_id)
             
+            # 分页在数据库执行，并以创建时间倒序保证新上传文档优先返回。
             query = query.offset(skip).limit(limit).order_by(desc(Document.created_at))
             
             result = await self.db.execute(query)
@@ -579,12 +649,17 @@ class EnhancedDocumentService(BaseDocumentService):
             raise
 
     async def get_by_id(self, document_id: str, user_id: Optional[UUID] = None) -> Optional[Document]:
-        """根据ID获取文档，可选择验证用户权限"""
+        """把字符串 ID 转为 UUID 并读取文档，可选地把用户归属并入 SQL 条件。
+
+        需要权限隔离的调用必须传 ``user_id``；省略它时这是内部管理式查询，不会验证资源
+        所有者。无效 ID、数据库异常和未找到都统一返回 ``None``，调用方需据此决定 404 或
+        权限错误，不能把本方法的返回值直接解释为某一种失败原因。
+        """
         try:
-            # 将字符串ID转换为UUID
+            # UUID 转换在查询前完成，非法外部输入不会进入数据库表达式。
             doc_uuid = UUID(document_id)
             
-            # 构建查询
+            # 传入 user_id 时，资源存在性与归属在同一条 SQL 中判断，避免先查后验的窗口。
             query = select(Document).where(Document.id == doc_uuid)
             if user_id:
                 query = query.where(Document.user_id == user_id)
@@ -612,9 +687,13 @@ class EnhancedDocumentService(BaseDocumentService):
             return None
 
     async def get_document_chunks(self, document_id: str, user_id: UUID) -> List[Dict[str, Any]]:
-        """从langchain_pg_embedding表获取文档块用于预览"""
+        """校验文档归属后，从 LangChain 向量表读取用于预览的原始块。
+
+        这里不执行相似度检索，而是按 ``chunk_index`` 返回指定文档的全部块。ORM 文档归属是
+        可信权限边界，向量元数据中的 ``document_id`` 仅在通过该校验后用于筛选块。
+        """
         try:
-            # 首先检查文档是否存在且用户有权限
+            # 先确认业务记录存在；随后用认证用户 ID 显式比较所有者。
             document = await self.get_by_id(document_id)
             if not document:
                 raise ValueError("文档未找到")
@@ -622,7 +701,7 @@ class EnhancedDocumentService(BaseDocumentService):
             if document.user_id != user_id:
                 raise ValueError("权限被拒绝")
             
-            # 直接查询langchain_pg_embedding表
+            # LangChain 未映射为本项目 ORM 模型，因此使用参数化 SQL 读取 JSON 元数据。
             query = text("""
                 SELECT 
                     id,
@@ -654,7 +733,11 @@ class EnhancedDocumentService(BaseDocumentService):
             raise
 
     async def delete(self, document: Document) -> None:
-        """从langchain_pg_embedding删除文档及其块"""
+        """先在一个数据库事务中删除向量块和 Document，再清理磁盘文件。
+
+        数据库提交完成后才调用 ``os.unlink``；若文件删除失败，已提交的记录和块删除不会因
+        随后的 ``rollback`` 恢复，磁盘上可能保留孤立文件。
+        """
         try:
             # 从langchain_pg_embedding表删除文档块
             delete_query = text("""
@@ -683,7 +766,11 @@ class EnhancedDocumentService(BaseDocumentService):
         file_hash: str,
         user_id: UUID
     ) -> Optional[Document]:
-        """根据文件哈希获取文档"""
+        """在当前用户范围内按内容哈希查重。
+
+        同一份文件允许由不同用户分别保存；因此哈希不能单独作为全局资源标识，必须与
+        ``user_id`` 组合查询。
+        """
         query = select(Document).where(
             Document.file_hash == file_hash,
             Document.user_id == user_id
@@ -692,7 +779,10 @@ class EnhancedDocumentService(BaseDocumentService):
         return result.scalar_one_or_none()
 
     def _get_mime_type(self, filename: str) -> str:
-        """根据文件名确定MIME类型"""
+        """依据文件扩展名生成持久化 MIME，未知格式退回二进制流类型。
+
+        该值用于选择后续文本提取器，不是读取文件头得到的安全校验结果。
+        """
         extension = filename.lower().split('.')[-1] if '.' in filename else ''
         mime_types = {
             'pdf': 'application/pdf',
@@ -706,7 +796,11 @@ class EnhancedDocumentService(BaseDocumentService):
         return mime_types.get(extension, 'application/octet-stream')
 
     async def _save_temp_file(self, content: bytes, filename: str) -> str:
-        """临时保存文件以进行处理"""
+        """把字节写到系统临时目录，返回供路径型解析器使用的文件名。
+
+        此方法只创建文件，不负责删除；当前调用方 ``process_document`` 在 ``finally`` 中承担
+        清理责任。文件名沿用上传名，因此上层应确保传入的是已净化的基础文件名。
+        """
         temp_dir = tempfile.gettempdir()
         temp_file_path = os.path.join(temp_dir, f"temp_{filename}")
         
@@ -716,12 +810,16 @@ class EnhancedDocumentService(BaseDocumentService):
         return temp_file_path
 
     async def _save_file(self, content: bytes, filename: str, user_id: UUID) -> str:
-        """永久保存文件"""
-        # 创建用户特定的上传目录
+        """将原始字节持久化到用户目录，并通过数字后缀避免覆盖同名文件。
+
+        文件系统写入不属于 SQLAlchemy 事务；调用方数据库提交失败时，该路径不会自动回滚。
+        ``user_id`` 只用于目录隔离，文件名安全性仍依赖上游上传校验。
+        """
+        # 每个认证用户拥有独立目录，降低不同用户同名文件之间的冲突。
         upload_dir = os.path.join(settings.UPLOAD_DIR, str(user_id))
         os.makedirs(upload_dir, exist_ok=True)
         
-        # 生成唯一文件名
+        # 不覆盖既有文件；依次尝试 filename、filename_1、filename_2 等可用路径。
         file_path = os.path.join(upload_dir, filename)
         counter = 1
         base_name, extension = os.path.splitext(filename)
@@ -738,4 +836,3 @@ class EnhancedDocumentService(BaseDocumentService):
         return file_path
 
     
-

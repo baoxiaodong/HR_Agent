@@ -1,5 +1,9 @@
 """
-用于存储简历信息和评价结果的简历评价模型
+简历原文、候选人结构化信息与 AI 评价结果模型。
+
+记录同时保存磁盘附件位置、解析文本、模型提取字段、各维度得分和原始模型响应，便于列表
+展示与结果追溯。JD 和评分标准来自远程服务，因此对应 UUID 只作为业务引用保存，不声明
+本地数据库外键。
 """
 from sqlalchemy import Column, String, Text, JSON, ForeignKey, Integer, Float, Enum
 from sqlalchemy.dialects.postgresql import UUID
@@ -85,7 +89,11 @@ class ResumeEvaluation(BaseModel):
         return f"<ResumeEvaluation(id={self.id}, candidate_name='{self.candidate_name}', total_score={self.total_score})>"
 
     def to_evaluation_result(self):
-        """转换为前端需要的评价结果格式"""
+        """把 ORM 对象装配成当前前端约定的评价结果字典。
+
+        UUID、枚举和时间在这里转换为 JSON 可编码值；中英文字段名混用是现有前端协议，
+        不代表数据库列名。该方法不重新计算评分，也不暴露完整 ``ai_response``。
+        """
         return {
             "id": str(self.id),
             "evaluation_metrics": self.evaluation_metrics or [],

@@ -1,6 +1,9 @@
 """
-职位描述服务层
-包含所有职位描述相关的业务逻辑
+职位描述领域的远程服务门面。
+
+当前 JD 数据不在本进程直接持久化，所有增删改查均通过 ``remote_service_client`` 转发到
+HR 服务；构造函数保留 ``db`` 参数仅为兼容既有端点。服务同时把 Pydantic 数据转换为
+可传输 JSON，并兼容远程保存接口字段不完整的响应。
 """
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class JobDescriptionService:
-    """职位描述服务类"""
+    """在认证用户上下文中适配远程 JD CRUD、分页和软删除。"""
     
     def __init__(self, db=None):
         # 不再需要数据库会话，但保留参数以保持接口兼容
@@ -46,16 +49,19 @@ class JobDescriptionService:
             Exception: 创建失败时抛出异常
         """
         try:
-            # 准备请求数据，使用 mode='json' 确保 UUID/日期等类型可序列化
+            # Schema 在 API 层完成字段校验；这里转成纯 JSON 数据，避免 UUID、日期等对象
+            # 直接进入 HTTP 客户端后无法编码。
             request_data = jd_data.model_dump(mode="json")
-            
-            # 发送POST请求到远程服务
+
+            # user_id 不混入业务正文，而是交给统一远程客户端附加用户上下文。
+            # 远程 HR 服务据此完成数据归属隔离，本服务不直接写本地数据库。
             result_data = await remote_service_client.post(
                 endpoint="/job-descriptions/save",
                 data=request_data,
                 user_id=user_id
             )
-            
+
+            # 保存接口可能只返回 id 等少量字段，因此不能直接用远程结果构造完整响应。
             jd_response = self._build_job_description_response(result_data, request_data, user_id)
             logger.info(f"成功创建职位描述: {jd_response.id} - {jd_response.title}")
             return jd_response
@@ -72,14 +78,21 @@ class JobDescriptionService:
         jd_id: Optional[str] = None,
     ) -> JobDescriptionResponse:
         """兼容远程保存接口返回部分字段，避免已落库但本地响应校验误报失败。"""
+        # 部分远程接口把实体包在 data 中，另一些直接返回实体；先统一成 payload。
         payload = result_data.get("data") if isinstance(result_data.get("data"), dict) else result_data
+
+        # 先放原请求，再覆盖远程返回值：远程生成的 id、时间等服务端事实优先，
+        # 请求中的 title/content 等字段只负责补齐“保存成功但返回精简”的情况。
         merged_data = {
             **request_data,
             **payload,
         }
         now = datetime.now(timezone.utc).isoformat()
         if jd_id:
+            # 更新接口若不回传 id，仍可使用 URL 中已确认的资源 id。
             merged_data.setdefault("id", jd_id)
+
+        # 以下默认值只在远程响应和原请求都缺失时补入，不会覆盖真实返回值。
         merged_data.setdefault("user_id", str(user_id))
         merged_data.setdefault("workflow_type", request_data.get("workflow_type") or "jd_generation")
         merged_data.setdefault("created_at", now)
@@ -87,6 +100,7 @@ class JobDescriptionService:
         merged_data.setdefault("is_active", True)
 
         try:
+            # 最后仍由响应 Schema 做一次边界校验，禁止把结构异常的远程数据直接交给 API。
             return JobDescriptionResponse(**merged_data)
         except ValidationError as exc:
             logger.error(
@@ -119,17 +133,18 @@ class JobDescriptionService:
             Exception: 更新失败时抛出异常
         """
         try:
-            # 准备请求数据
+            # PATCH 语义：只转发调用方实际提供的字段，未提交字段保持远端原值。
             request_data = jd_data.model_dump(exclude_unset=True)
-            
-            # 发送PUT请求到远程服务
+
+            # jd_id 定位资源，user_id 继续作为远程服务的数据归属上下文。
             result_data = await remote_service_client.put(
                 endpoint=f"/job-descriptions/{jd_id}",
                 data=request_data,
                 user_id=user_id
             )
-            
+
             logger.info(f"成功更新职位描述: {jd_id}")
+            # 更新响应同样可能是精简结构，用本次变更字段和 URL id 补齐公开响应。
             return self._build_job_description_response(result_data, request_data, user_id, jd_id=jd_id)
 
         except ValueError:
@@ -198,15 +213,16 @@ class JobDescriptionService:
         logger.info(f"📥 获取JD列表请求: page={page}, size={size}, status_filter={status_filter}, user_id={user_id}")
 
         try:
-            # 准备查询参数
+            # 页码、页大小和可选状态都作为查询参数传给远程服务；user_id 仍单独传递，
+            # 避免调用方通过查询正文伪造其他用户的数据范围。
             additional_params = {
                 "page": page,
                 "size": size
             }
             if status_filter:
                 additional_params["status_filter"] = status_filter
-            
-            # 发送GET请求到远程服务
+
+            # 列表的分页结构由远程服务统一计算，本地不重复切片或重算 total。
             result_data = await remote_service_client.get(
                 endpoint="/job-descriptions/",
                 user_id=user_id,
@@ -240,12 +256,16 @@ class JobDescriptionService:
             Exception: 删除失败时抛出异常
         """
         try:
+            # JD 与评分标准位于远程 HR 服务。删除 JD 前先查询关联评分标准，
+            # 尽量维持跨资源的一致性；这里没有跨服务事务，因此只能采用“尽力清理”。
             deleted_criteria = []
             criteria_failures = []
             try:
+                # 放在函数内导入可避免 JD 服务与评分标准服务在模块加载时循环依赖。
                 from app.services.scoring_criteria_service import ScoringCriteriaService
 
                 scoring_service = ScoringCriteriaService(self.db)
+                # 当前远程列表接口没有专用的“删除全部关联项”能力，先取最多 100 条再逐项删除。
                 criteria_list = await scoring_service.get_scoring_criteria_list(
                     user_id=user_id,
                     page=1,
@@ -257,18 +277,21 @@ class JobDescriptionService:
                         await scoring_service.delete_scoring_criteria(str(criteria.id), user_id)
                         deleted_criteria.append({"id": str(criteria.id), "title": criteria.title})
                     except Exception as exc:
+                        # 单条评分标准失败不阻断其余清理，失败明细会随最终结果返回。
                         criteria_failures.append({"id": str(criteria.id), "title": criteria.title, "error": str(exc)})
                         logger.warning("删除 JD 关联评分标准失败 jd_id=%s criteria_id=%s: %s", jd_id, criteria.id, exc)
             except Exception as exc:
+                # 查询关联项本身失败时也继续删除 JD；这是明确的降级策略，并非原子级联删除。
                 criteria_failures.append({"error": str(exc)})
                 logger.warning("查询 JD 关联评分标准失败 jd_id=%s: %s", jd_id, exc)
 
-            # 发送DELETE请求到远程服务
+            # 无论关联项是否全部清理成功，都执行用户最初请求的 JD 删除。
             result_data = await remote_service_client.delete(
                 endpoint=f"/job-descriptions/{jd_id}",
                 user_id=user_id
             )
             if isinstance(result_data, dict):
+                # 把级联清理结果附加到远程响应，调用方可据此识别残留项并决定是否重试。
                 result_data["deleted_scoring_criteria"] = deleted_criteria
                 result_data["scoring_criteria_failures"] = criteria_failures
             

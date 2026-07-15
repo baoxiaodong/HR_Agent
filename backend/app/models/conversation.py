@@ -1,5 +1,9 @@
 """
-用于存储聊天历史和AI交互的对话模型
+聊天会话与消息的数据库模型。
+
+``Conversation`` 归属于一个用户并维护消息总数；删除会话时 ORM 关系会级联删除消息。
+``Message`` 保存角色、模型信息、检索上下文和用户反馈，并通过可选的自关联字段表示回复
+来源。实际消息顺序由创建时间和服务层查询共同确定。
 """
 from sqlalchemy import Column, String, Text, ForeignKey, JSON, Enum, Float, Integer
 from sqlalchemy.dialects.postgresql import UUID

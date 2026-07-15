@@ -1,5 +1,9 @@
 """
-用于从各种邮件服务器读取邮件的工具模块
+IMAP/POP3 邮件读取与 MIME 消息解析工具。
+
+本模块只负责建立协议连接、检索原始邮件并转换为内存中的 ``EmailMessage``；简历筛选、
+附件落盘、去重和数据库事务属于上层邮件服务。协议异常大多会被记录并转换为 ``False``、
+空列表或 ``None``，调用方需要把这些降级值与“邮箱确实没有邮件”区分处理。
 """
 import imaplib
 import platform
@@ -17,8 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 class EmailConfig:
-    """
-    邮箱配置类
+    """邮件协议连接参数的内存容器。
+
+    密码保持为明文属性以便协议库登录，因此对象不应被序列化进 API 响应或普通日志。
+    ``protocol`` 会统一为大写，实际支持范围在 ``EmailReader.connect`` 中校验。
     """
     def __init__(self, host: str, port: int, username: str, password: str, 
                  use_ssl: bool = True, protocol: str = "IMAP"):
@@ -31,8 +37,10 @@ class EmailConfig:
 
 
 class EmailMessage:
-    """
-    邮件消息容器
+    """解析后的邮件值对象。
+
+    ``body`` 与 ``html_body`` 分开保存；附件内容仍是内存中的原始字节及 MIME 元数据，
+    尚未经过文件类型校验、病毒扫描或落盘处理。
     """
     def __init__(self, subject: str, sender: str, recipients: List[str], 
                  date: datetime, body: str, html_body: Optional[str] = None,
@@ -47,8 +55,10 @@ class EmailMessage:
 
 
 class EmailReader:
-    """
-    用于从IMAP或POP3服务器读取邮件的工具类
+    """管理 IMAP/POP3 连接，并把协议响应转换成统一邮件对象。
+
+    推荐通过上下文管理器使用以确保退出时断开连接。连接、搜索和单封读取失败通常不会
+    向上抛出，而是记录日志并返回降级值；附件和正文会完整载入内存。
     """
 
     def __init__(self, config: EmailConfig):
@@ -176,15 +186,11 @@ class EmailReader:
             return 0
 
     def search_emails(self, criteria: list, charset: Optional[str] = "UTF-8") -> List[int]:
-        """
-        根据条件搜索邮件（仅限IMAP）
-        
-        Args:
-            criteria (str): 搜索条件（例如："FROM user@example.com", "SUBJECT 'test'"）
-            
-        Returns:
-            List[int]: 符合条件的邮件ID列表
-        """
+        """根据邮件协议搜索条件返回消息编号。
+
+    首次使用 UID SEARCH；异常时回退到普通 SEARCH，因此两个分支返回编号的稳定性语义
+    可能不同。空列表既可能表示无匹配，也可能表示协议不支持或查询失败。
+    """
         if not self.connection or self.config.protocol != "IMAP":
             return []
         
@@ -252,14 +258,9 @@ class EmailReader:
         return self._parse_email_message(email_message)
 
     def _get_pop3_email(self, msg_id: int) -> Optional[EmailMessage]:
-        """
-        使用POP3协议检索邮件
-        
-        Args:
-            msg_id (int): 邮件ID（基于1的索引）
-            
-        Returns:
-            EmailMessage: 邮件消息对象
+        """按 POP3 的从 1 开始序号读取原始消息并解析。
+
+        POP3 序号只在当前邮箱会话中有意义，不具备 IMAP UID 的稳定标识语义。
         """
         # POP3 uses 1-based indexing
         msg_lines, octets = self.connection.retr(msg_id)
@@ -268,14 +269,10 @@ class EmailReader:
         return self._parse_email_message(email_message)
 
     def _parse_email_message(self, email_message: Message) -> EmailMessage:
-        """
-        Parse email message into EmailMessage object
-        
-        Args:
-            email_message (Message): Raw email message
-            
-        Returns:
-            EmailMessage: Parsed email message
+        """把标准库 MIME 消息解析为内部 ``EmailMessage``。
+
+        多段邮件分别收集纯文本、HTML 和附件；未知编码用 UTF-8 忽略错误回退。日期解析只
+        覆盖当前固定格式，解析失败时使用本机当前时间，因此该时间不能视为可靠邮件证据。
         """
         # Decode subject
         subject = self._decode_header_value(email_message.get("Subject", ""))
@@ -356,14 +353,10 @@ class EmailReader:
         )
 
     def _decode_header_value(self, header_value: str) -> str:
-        """
-        Decode email header value
-        
-        Args:
-            header_value (str): Encoded header value
-            
-        Returns:
-            str: Decoded header value
+        """解码可能由多段文本和不同字符集组成的 MIME 邮件头。
+
+        声明字符集解码失败时回退到 UTF-8 并忽略非法字节，优先保证主题、发件人等字段
+        可展示；因此返回文本可能不是原始字节的无损表示。
         """
         if not header_value:
             return ""
@@ -384,26 +377,25 @@ class EmailReader:
         return decoded_string
 
     def __enter__(self):
-        """Context manager entry"""
+        """进入上下文时尝试连接；调用方仍可检查连接结果。"""
         self.connect()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
+        """退出上下文时断开连接，不吞掉业务代码抛出的异常。"""
         self.disconnect()
 
 
-# Example usage:
+# 仅用于手工联调协议连接；示例中的账号配置不参与应用运行时依赖注入。
 if __name__ == "__main__":
-    # IMAP example
+    # 手工联调示例。运行前必须替换为专用测试邮箱，不能把真实凭据提交到源码。
     config = EmailConfig(
         host="imap.163.com",
         port=993,
-        username="15084947675@163.com",
-        # password="Pengsir2023",
-        password="QHcFg32mFuEgMSVi",
+        username="user@example.com",
+        # password="change-me",
+        password="change-me",
         protocol="IMAP"
-        #QHcFg32mFuEgMSVi
     )
 
     with EmailReader(config) as reader:

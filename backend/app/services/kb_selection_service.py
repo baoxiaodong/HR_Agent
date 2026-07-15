@@ -1,5 +1,9 @@
 """
-知识库选择服务：列出用户文档并使用LLM为给定问题选择最佳匹配文档，然后返回其knowledge_base_id。
+基于问题自动选择知识库的服务。
+
+服务先读取当前用户可见的候选文档，只把文档 ID 和文件名组成紧凑提示交给 LLM；模型
+返回最佳文档后，再从原候选集合反查可信的知识库 ID。候选数上限用于控制 token 成本，
+模型输出无效时返回空选择而不是猜测资源。
 """
 import logging
 import json
@@ -15,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class KBSelectionService:
-    """通过LLM对文档进行排名来自动选择知识库的服务"""
+    """用 LLM 推荐候选文档，再以用户范围内的本地候选集确定可信知识库。"""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -27,15 +31,22 @@ class KBSelectionService:
         user_id: UUID,
         max_candidates: int = 100,
     ) -> List[Dict[str, Any]]:
-        """列出用户的候选文档（id、filename、knowledge_base_id）。
-        限制max_candidates以控制token使用量。
+        """
+        读取用户自己的候选文档，并转换成选择阶段使用的最小数据结构。
+
+        ``max_candidates`` 同时限制数据库返回量和后续提示词长度，避免文档较多时
+        一次请求消耗过多 token。
         """
         try:
+            # 这里只做数据库查询，不生成向量，也不调用大模型。
             documents = await self.document_service.get_user_documents(
                 user_id=user_id,
                 skip=0,
                 limit=max_candidates,
             )
+
+            # document_id 和 filename 可以发给模型；knowledge_base_id 只保留在本地，
+            # 等模型选出文档后再反查，不能让模型自行编造知识库 ID。
             candidates: List[Dict[str, Any]] = []
             for doc in documents:
                 candidates.append({
@@ -53,14 +64,17 @@ class KBSelectionService:
         question: str,
         candidates: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        """使用LLM从候选文档中选择最佳匹配文档。
-        返回包含键的字典：document_id、confidence、reason（可选）。
+        """
+        让大模型从候选文档中选出一个最相关项。
+
+        返回值只是模型建议，调用方仍需回到原始候选列表校验 document_id；模型输出
+        不是合法 JSON、缺少关键字段或调用失败时返回 ``None``，交由上层执行降级。
         """
         if not candidates:
+            # 空列表无需调用模型，既节省成本，也避免模型在没有候选时凭空回答。
             return None
 
-        # 准备紧凑的候选列表以最小化token使用
-        # 仅传递filename和document_id（如果需要下游映射，可包含kb id）
+        # 提示词只携带选择所必需的字段，减少 token 用量并隐藏内部 knowledge_base_id。
         compact = [
             {
                 "document_id": c.get("document_id"),
@@ -81,7 +95,7 @@ class KBSelectionService:
         )
 
         try:
-            # 使用确定性选择
+            # temperature=0 减少随机性；max_tokens 限制模型只能返回短小的选择结果。
             response = await self.llm_service.client.chat.completions.create(
                 model=self.llm_service.llm_model,
                 messages=[
@@ -92,14 +106,15 @@ class KBSelectionService:
                 max_tokens=400,
             )
             content = response.choices[0].message.content.strip()
-            # 尝试解析JSON
+
+            # 模型输出属于不可信外部数据：先解析 JSON，再检查业务必需字段。
             selected: Dict[str, Any] = json.loads(content)
-            # 基本验证
             if not isinstance(selected, dict) or "document_id" not in selected:
                 logger.warning(f"Invalid LLM selection output: {content}")
                 return None
             return selected
         except Exception as e:
+            # 自动选择是辅助能力，失败时返回空结果，让主业务决定如何降级。
             logger.error(f"Error selecting best document via LLM: {e}")
             return None
 
@@ -109,10 +124,15 @@ class KBSelectionService:
         user_id: UUID,
         max_candidates: int = 100,
     ) -> Dict[str, Any]:
-        """高级方法：列出候选文档，请求LLM选择最佳文档，返回知识库ID。
-        返回：{ knowledge_base_id, document_id, filename, confidence, reason, candidates_count }
         """
+        串联“读取候选、模型选择、本地校验”三个阶段，返回知识库选择结果。
+
+        无候选或模型失败时仍返回固定结构，前端无需针对异常形状做额外判断。
+        """
+        # 第一阶段：候选已经按 user_id 过滤，模型看不到其他用户的文档。
         candidates = await self.list_candidates(user_id=user_id, max_candidates=max_candidates)
+
+        # 第二阶段：模型只负责推荐 document_id，不直接决定最终知识库 ID。
         selection = await self.select_best_document(question=question, candidates=candidates)
 
         if not selection:
@@ -129,7 +149,7 @@ class KBSelectionService:
         confidence = selection.get("confidence", 0.0)
         reason = selection.get("reason", "")
 
-        # 查找选中的候选文档以获取知识库ID和文件名
+        # 第三阶段：只信任本地候选集合。即使模型返回了不存在的 ID，也不会映射到任意知识库。
         selected_candidate = next((c for c in candidates if c["document_id"] == selected_doc_id), None)
         if not selected_candidate:
             return {

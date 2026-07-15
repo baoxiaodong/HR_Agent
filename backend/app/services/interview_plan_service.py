@@ -1,6 +1,9 @@
 """
-面试方案服务
-处理面试方案相关的核心业务逻辑
+面试方案领域的业务门面。
+
+方案主体的增删改查委托给远程 HR 服务；创建前会先在本地数据库确认关联简历评价存在且
+属于当前用户，防止把无效关联发送到远端。因此本服务同时持有数据库会话和远程客户端，
+承担本地资源校验与远程持久化之间的边界协调。
 """
 import logging
 from typing import Any, List, Optional, Dict
@@ -18,10 +21,10 @@ from app.services.remote_service_client import remote_service_client
 
 logger = logging.getLogger(__name__)
 class InterviewPlanService:
-    """面试方案服务类"""
+    """按用户归属管理面试方案的本地创建、查询、更新和物理删除事务。"""
 
     def __init__(self, db=None):
-        # 不再需要数据库会话，但保留参数以保持接口兼容
+        # 方案主体保存在远端，但创建方案前仍需通过本地会话校验简历评价的存在性和归属。
         self.db = db
 
     # 对应前端保存方案
@@ -43,7 +46,8 @@ class InterviewPlanService:
         Raises:
             HTTPException: 简历评价未找到或无权限访问时抛出
         """
-        # 验证简历评价是否存在且属于当前用户
+        # 先在本地完成资源归属校验。把 id 与 user_id 放在同一条 SQL 条件中，
+        # 即使调用者猜到其他用户的评价 id，也只能得到统一的“不存在或无权限”结果。
         result = await self.db.execute(
             select(ResumeEvaluation).where(
                 and_(
@@ -55,31 +59,34 @@ class InterviewPlanService:
         resume_evaluation = result.scalar_one_or_none()
 
         if not resume_evaluation:
+            # 不区分“确实不存在”和“属于其他用户”，避免暴露跨用户资源是否存在。
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="简历评价记录未找到或无权限访问"
             )
         try:
-            # 准备请求数据，使用mode='json'确保UUID等类型被正确序列化
+            # 本地查询只负责校验，不产生写操作；方案内容转成 JSON 后交给远程 HR 服务持久化。
             request_data = plan_data.model_dump(mode='json')
-            
-            # 发送POST请求到远程服务
+
+            # user_id 作为远程数据归属上下文继续向下传递，防止只在本地校验关联项却未隔离方案本身。
             result_data = await remote_service_client.post(
                 endpoint="/interview-plans/save-generated",
                 data=request_data,
                 user_id=user_id
             )
-            
+
             logger.info(f"成功创建面试方案: {result_data.get('id')}")
+            # 远程结果在离开服务层前再按公开 Schema 校验一次。
             return InterviewPlanResponse(**result_data)
             
         except ValueError as e:
-            # 远程服务返回404时抛出ValueError，转换为HTTPException
+            # 统一客户端把远程 404 转成 ValueError；服务层再映射回当前 API 的 404 语义。
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=str(e)
             )
         except Exception as e:
+            # 网络错误、远程 5xx 或响应校验错误保留原异常，交给全局异常处理器记录和响应。
             logger.error(f"创建面试方案失败: {str(e)}")
             raise
 
@@ -105,16 +112,16 @@ class InterviewPlanService:
             HTTPException: 面试方案未找到或无权限访问时抛出
         """
         try:
-            # 准备请求数据，使用mode='json'确保UUID等类型被正确序列化
+            # 只序列化调用方实际修改的字段，避免 Update Schema 的默认值覆盖远端原内容。
             request_data = plan_data.model_dump(mode='json', exclude_unset=True)
-            
-            # 发送PUT请求到远程服务
+
+            # 资源 id 来自路径，用户 id 独立传给远程客户端；远端负责方案本身的归属校验。
             result_data = await remote_service_client.put(
                 endpoint=f"/interview-plans/{plan_id}",
                 data=request_data,
                 user_id=user_id
             )
-            
+
             logger.info(f"成功更新面试方案: {plan_id}")
             return InterviewPlanResponse(**result_data)
             
@@ -235,21 +242,23 @@ class InterviewPlanService:
             包含面试方案列表和分页信息的字典
         """
         try:
-            # 准备查询参数
+            # 分页交由远程服务执行；可选评价 id 用于把方案列表收窄到某次简历评价。
             additional_params = {
                 "page": page,
                 "size": size
             }
             if resume_evaluation_id:
+                # 查询参数必须是 HTTP 可传输的字符串，而不是 Python UUID 对象。
                 additional_params["resume_evaluation_id"] = str(resume_evaluation_id)
-            
-            # 发送GET请求到远程服务
+
+            # user_id 不放入可由调用方组装的筛选字典，而是作为独立的归属上下文传递。
             result_data = await remote_service_client.get(
                 endpoint="/interview-plans/",
                 user_id=user_id,
                 additional_params=additional_params
             )
-            
+
+            # 本方法保持远程分页结构原样返回，由端点的 response_model 负责最终响应校验。
             logger.info(f"成功获取面试方案列表，第 {page} 页，共 {result_data.get('total', 0)} 条结果")
             return result_data
             

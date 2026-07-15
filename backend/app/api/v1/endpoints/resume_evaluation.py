@@ -1,5 +1,9 @@
 """
-简历评价API端点
+简历评价结果管理与附件导出 API。
+
+自动评价接口把邮件系统提供的简历文本交给 ``ResumeEvaluationService`` 完成用户匹配、
+JD 匹配、AI 评分和持久化；其余接口基于当前登录用户查询、更新或删除评价记录。
+批量导出会先按用户过滤数据库记录，再从磁盘读取原始附件并在内存中生成 ZIP 响应。
 """
 import asyncio
 import io
@@ -54,15 +58,14 @@ async def evaluate_resume_auto(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    接收简历文本字符串，自动匹配最合适的JD并进行AI评分，同时将文本作为附件保存在本地。
+    处理邮件抓取流程提交的纯文本简历，并自动完成评价。
 
-    - **resume_text**: 简历文本内容
-    - **subject**: 投递邮件主题（可选，用于辅助匹配JD）
-    - **filename**: 文件名（可选，默认自动生成 .txt 文件名）
-    - **login_name**: 登录用户名（必选）
+    该入口没有 Bearer 用户上下文，服务层会使用 ``login_name`` 查找归属用户；随后根据
+    ``position`` 辅助匹配 JD、调用 AI 评分、保存文本附件和评价记录，最后用响应 Schema
+    校验服务层返回的数据结构。
     """
     try:
-        # 调用服务层的文本简历自动评价方法
+        # 端点只传递已经由 AutoEvaluateRequest 校验过的字段；用户/JD 匹配均在服务层完成。
         evaluation_service = ResumeEvaluationService(db)
         result = await evaluation_service.evaluate_resume_text_auto(
             login_name=payload.login_name,
@@ -71,14 +74,18 @@ async def evaluate_resume_auto(
             subject=payload.position or ""
         )
 
+        # Schema 构造会在返回前再次验证 ID、分数、状态等字段是否符合 API 契约。
         return ResumeEvaluationResult(**result)
 
     except ValueError as e:
+        # 可预期的输入或匹配失败直接返回具体原因，便于调用方修正数据。
         logger.warning(f"简历评价参数错误: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
+        # 保留服务层已经明确指定的 HTTP 状态码。
         raise
     except Exception as e:
+        # 其他内部错误不把堆栈和供应商信息暴露给客户端。
         logger.error(f"自动匹配并评价简历失败: {e}")
         raise HTTPException(status_code=500, detail="自动匹配评价服务暂时不可用")
 
@@ -91,19 +98,19 @@ async def get_evaluation_history(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    获取用户的简历评价历史
+    分页返回当前登录用户自己的评价记录。
 
-    - **skip**: 跳过的记录数
-    - **limit**: 返回的记录数限制
-    - **status**: 状态过滤 (pending, rejected, interview)
+    状态字符串先转换为 ``ResumeStatus`` 枚举，查询上限强制收敛到 100，避免客户端通过
+    过大的 limit 一次性读取全部历史。
     """
     try:
-        # 验证状态参数
+        # 在查询数据库前校验状态，非法值作为 400 参数错误返回。
         status_filter = await ResumeEvaluationService.validate_status_param(status)
-        
-        # 限制查询数量
+
+        # 即使调用方传入更大的值，也只允许服务层最多查询 100 条。
         limit = min(limit, 100)
 
+        # user_id 是数据隔离条件，服务层不会返回其他用户的评价记录。
         evaluation_service = ResumeEvaluationService(db)
         result = await evaluation_service.get_evaluation_history_with_pagination(
             user_id=current_user.id,
@@ -124,8 +131,10 @@ async def get_evaluation_history(
 
 @router.get("/supported-formats")
 async def get_supported_formats():
-    """
-    获取支持的文件格式
+    """返回解析器当前声明支持的扩展名和大小限制。
+
+    该响应是服务层维护的静态能力描述，不读取数据库，也不代表上传内容已经通过实际解析；
+    文件大小、扩展名和正文有效性仍会在评价主流程中再次校验。
     """
     return await ResumeEvaluationService.get_supported_formats()
 
@@ -135,13 +144,13 @@ async def get_evaluation_detail(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    获取特定评价结果的详细信息
+    """返回当前用户拥有的一条评价记录的扁平化详情。
 
-    - **evaluation_id**: 评价记录ID
+    路径参数先转换为 UUID；服务层在同一查询中组合评价 ID 与用户 ID，未命中统一返回 404，
+    因此不会向请求方暴露记录是不存在还是属于其他用户。结果再经过响应 Schema 校验。
     """
     try:
-        # 验证evaluation_id格式
+        # 字符串 ID 在访问数据库前收窄为 UUID，格式错误与资源未找到保持不同状态码。
         eval_uuid = await ResumeEvaluationService.validate_uuid_param(evaluation_id, "评价ID")
 
         evaluation_service = ResumeEvaluationService(db)
@@ -171,13 +180,13 @@ async def delete_evaluation(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    删除评价记录
+    """删除当前用户的一条评价及其远程面试方案关联。
 
-    - **evaluation_id**: 评价记录ID
+    服务层先按评价 ID 和用户 ID 校验归属，再删除远程面试方案，最后提交本地评价删除。
+    两个数据源无法组成原子事务：远程删除成功而本地提交失败时，评价仍在但关联方案已删除。
     """
     try:
-        # 验证evaluation_id格式
+        # 先拒绝非法路径参数，避免把格式错误误报为记录不存在。
         eval_uuid = await ResumeEvaluationService.validate_uuid_param(evaluation_id, "评价ID")
 
         evaluation_service = ResumeEvaluationService(db)
@@ -208,14 +217,13 @@ async def update_resume_status(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    更新简历状态
+    """把当前用户的一条评价推进到指定候选状态。
 
-    - **evaluation_id**: 评价记录ID
-    - **status**: 新状态 (pending, rejected, interview)
+    路径 ID 和状态字符串分别转换为 UUID、``ResumeStatus``；服务层再以用户 ID 限定目标记录，
+    修改 ORM 状态并提交单条本地事务。非法枚举返回 400，未命中或越权统一返回 404。
     """
     try:
-        # 验证参数格式
+        # 在服务写入前完成两类类型收窄，后续分支只处理合法 UUID 和状态枚举。
         eval_uuid = await ResumeEvaluationService.validate_uuid_param(evaluation_id, "评价ID")
         new_status = await ResumeEvaluationService.validate_status_param(status)
 
@@ -248,16 +256,24 @@ async def export_zip(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db)
 ):
-    """批量导出简历原始附件 ZIP"""
+    """
+    把当前用户选中的原始简历附件打包为内存 ZIP。
+
+    流程包括数量校验、按用户过滤数据库记录、净化 ZIP 内文件名、读取主/兼容路径、关闭
+    ZipFile 后提取完整字节，最后构造下载响应。单个附件缺失会记录到 ``failed``，不会让
+    其他可读取附件停止打包。
+    """
     resume_ids = payload.resume_ids
+
+    # 空列表没有导出意义；50 条上限用于约束磁盘读取量和内存中的 ZIP 大小。
     if not resume_ids:
         raise HTTPException(status_code=400, detail="resume_ids 不能为空")
     if len(resume_ids) > 50:
         raise HTTPException(status_code=400, detail="单次导出数量不能超过 50")
 
-    # 使用ORM查询用户可见的简历附件
     from sqlalchemy import select
 
+    # user_id 必须和资源 ID 同时过滤，防止用户通过猜测 UUID 导出他人的简历附件。
     stmt = (
         select(ResumeEvaluation)
         .where(
@@ -271,7 +287,7 @@ async def export_zip(
     if not resume_evaluations:
         raise HTTPException(status_code=400, detail="未找到相关简历")
 
-    # 打包 ZIP - 修复版本
+    # BytesIO 让服务无需创建临时 ZIP 文件，但内存占用会随附件总大小增长。
     io_buf = io.BytesIO()
     failed = []
 
@@ -281,11 +297,13 @@ async def export_zip(
             for resume in resume_evaluations:
                 logger.info(f"处理简历: {resume.original_filename}, 路径: {resume.file_path}")
                 original_filename = resume.original_filename
-                # 简单过滤路径穿越
+
+                # 只保留文件名，去掉调用方或历史数据中的目录部分，避免 ZIP 路径穿越。
                 safe_name = Path(original_filename).name
 
                 file_found = False
-                # 直接使用数据库中存储的文件路径
+
+                # 优先读取数据库记录的当前路径；它是正常流程保存附件时的权威位置。
                 if resume.file_path and os.path.exists(resume.file_path):
                     logger.info(f"文件路径存在: {resume.file_path}")
                     try:

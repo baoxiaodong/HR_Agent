@@ -1,8 +1,9 @@
 """
-职位描述(JD)管理相关的API接口
-- 创建、更新、删除职位描述记录
-- 保存和管理职位描述内容
-- 查询职位描述列表和详情
+职位描述（JD）管理 API。
+
+本模块管理已经生成并保存的 JD，不负责调用大模型生成文本；生成流程位于
+``hr_workflows`` 端点。每次读写都会把当前用户 ID 传入 ``JobDescriptionService``，
+由服务层同时完成资源归属检查、分页查询和软删除。
 """
 import logging
 from typing import Any, Optional
@@ -30,8 +31,9 @@ async def save_job_description(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    保存生成的JD到数据库
+    """把已生成的 JD Schema 连同认证用户 ID 交给远程领域服务保存。
+
+    端点不再解析模型文本；服务层负责请求体适配和远程响应规范化。当前通用异常统一返回 500。
     """
     try:
         service = JobDescriptionService(db)
@@ -51,8 +53,10 @@ async def update_job_description(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    更新已保存的JD
+    """更新当前用户范围内已保存 JD 的显式字段。
+
+    JD ID、局部更新 Schema 和用户 ID 一并交给远程服务；远程资源未找到或归属不匹配使用
+    ``ValueError`` 表达并映射为 404，其他调用失败返回 500。
     """
     try:
         service = JobDescriptionService(db)
@@ -76,8 +80,10 @@ async def get_job_description(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    获取指定的JD
+    """在认证用户上下文中读取一条远程 JD。
+
+    用户 ID 作为远程查询参数参与资源隔离；未命中转换为 404，成功响应再由
+    ``JobDescriptionResponse`` 约束字段形状。
     """
     try:
         service = JobDescriptionService(db)
@@ -103,8 +109,10 @@ async def list_job_descriptions(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    获取用户的JD列表
+    """分页列出认证用户的远程 JD，可选按状态筛选。
+
+    Query 先限制页码和大小，服务层继续传递用户范围并规范化远程分页结果；端点使用列表
+    Schema 再次固定 ``items/total/page/size/pages`` 契约。
     """
     try:
         service = JobDescriptionService(db)
@@ -129,8 +137,10 @@ async def delete_job_description(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    删除JD（软删除）
+    """在认证用户范围内软删除一条远程 JD。
+
+    服务层通过远程接口推进删除状态而不是移除本地记录；未命中或归属不匹配映射为 404，
+    其他远程错误返回 500。
     """
     try:
         service = JobDescriptionService(db)

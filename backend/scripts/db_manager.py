@@ -1,13 +1,10 @@
-
 """
-HR Agent后端数据库管理脚本
+HR Agent 数据库生命周期与 Alembic 迁移命令入口。
 
-此脚本提供数据库管理工具：
-- 初始化数据库
-- 创建迁移
-- 应用迁移
-- 重置数据库
-- 种子初始数据
+脚本作为独立进程运行，因此先把 ``backend`` 加入 ``sys.path``，再复用应用配置和模型元
+数据。创建/删除数据库需要连接 PostgreSQL 的 ``postgres`` 管理库；迁移操作则交给
+Alembic。``reset`` 会终止现有连接并永久删除目标数据库，只应对确认过的开发/测试配置
+执行。
 """
 
 import asyncio
@@ -34,14 +31,22 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
-    """数据库管理工具"""
+    """把数据库级管理动作封装为可由命令行调用的方法。
+
+    Alembic 方法是同步调用；数据库创建和删除使用短生命周期异步引擎，完成后显式释放
+    连接池。异常只在本层记录后继续抛出，由 ``main`` 统一设置进程失败退出码。
+    """
     
     def __init__(self):
         self.alembic_cfg = Config(str(backend_dir / "alembic.ini"))
         self.alembic_cfg.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
     
     async def create_database(self):
-        """如果数据库不存在则创建数据库"""
+        """连接管理库并在目标库不存在时创建它。
+
+        ``CREATE DATABASE`` 不能在普通事务块中运行，因此查询存在性后显式 ``COMMIT``。
+        数据库名来自可信应用配置，不能直接替换为未校验的命令行输入。
+        """
         try:
             # 从URL中提取数据库名称
             db_name = settings.DATABASE_NAME
@@ -72,7 +77,11 @@ class DatabaseManager:
             raise
     
     async def drop_database(self):
-        """删除数据库"""
+        """终止其他会话后删除配置指向的整个数据库。
+
+        PostgreSQL 的 ``DROP DATABASE`` 不能在普通事务块中执行，因此先显式结束当前事务。
+        该操作不可回滚，且会影响仍连接到目标库的应用进程。
+        """
         try:
             db_name = settings.DATABASE_NAME
             postgres_url = settings.DATABASE_URL.replace(f"/{db_name}", "/postgres")
@@ -144,7 +153,11 @@ class DatabaseManager:
             raise
     
     async def reset_database(self):
-        """重置数据库（删除、创建、迁移）"""
+        """依次删除、重建并迁移数据库。
+
+        这不是可回滚事务：删除成功后即使创建或迁移失败，原数据也不会恢复。日志中的
+        “重置完成”只会在三个阶段全部成功后出现。
+        """
         logger.info("正在重置数据库...")
         await self.drop_database()
         await self.create_database()

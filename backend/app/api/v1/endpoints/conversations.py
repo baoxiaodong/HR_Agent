@@ -1,5 +1,9 @@
 """
-对话管理端点
+对话与消息管理 API 端点。
+
+本模块负责会话所有权校验、分页参数接收以及响应结构转换；数据库查询和事务由
+``ConversationService`` 完成。部分接口显式把 SQLAlchemy 对象转换为字典，是为了在
+异步会话结束后避免懒加载属性引发 ``DetachedInstanceError`` 或序列化错误。
 """
 from typing import Any, List
 from fastapi import APIRouter, Depends, HTTPException
@@ -28,8 +32,10 @@ async def get_conversations(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    获取用户的对话列表
+    """分页读取认证用户自己的会话，并映射为响应 Schema 字段。
+
+    用户 ID 是服务查询的固定过滤条件；端点显式把 ORM 的 ``total_messages`` 重命名为
+    ``message_count``，同时避免异步会话结束后的懒加载序列化问题。
     """
     conversation_service = ConversationService(db)
     
@@ -65,8 +71,10 @@ async def create_conversation(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    创建新的对话
+    """以认证用户为所有者创建活动会话并返回稳定字典。
+
+    客户端 Schema 不控制 ``user_id``；服务层提交并刷新 ORM 后，端点显式映射消息计数和
+    时间字段，避免直接序列化已脱离会话的模型。
     """
     conversation_service = ConversationService(db)
     
@@ -98,8 +106,10 @@ async def get_conversation(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    根据ID获取对话
+    """读取一条会话并区分资源不存在与所有权不足。
+
+    服务层先按 ID 查询，再把数据库 ``user_id`` 与认证用户比较：未命中返回 404，越权返回
+    403。成功后端点显式映射 ORM 字段供响应 Schema 序列化。
     """
     conversation_service = ConversationService(db)
     
@@ -132,8 +142,10 @@ async def update_conversation(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    更新对话信息
+    """校验会话所有权后局部更新认证用户的会话。
+
+    端点先取得明确的 403/404，再由服务以会话 ID 和用户 ID 联合过滤并提交 ``exclude_unset``
+    字段；预期 HTTP 状态不会被通用错误包装覆盖。
     """
     conversation_service = ConversationService(db)
 
@@ -159,8 +171,10 @@ async def delete_conversation(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    删除对话
+    """校验所有权后，在一个本地事务中删除会话及其全部消息。
+
+    服务层先删除子表消息再删除父会话并一次提交；任一步失败会回滚。端点保留权限错误，
+    未产生删除时返回 400。
     """
     conversation_service = ConversationService(db)
     
@@ -193,8 +207,10 @@ async def get_conversation_messages(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    获取对话中的消息列表
+    """校验父会话所有权后，按时间正序分页返回消息。
+
+    消息查询本身只接收会话 ID，不具备用户隔离，因此前置会话权限检查不可省略；ORM 消息
+    随后转换为普通字典，固定上下文、反馈和父消息字段。
     """
     conversation_service = ConversationService(db)
     
@@ -241,8 +257,10 @@ async def add_conversation_message(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    向对话追加单条消息
+    """校验父会话归属后追加消息，并同步会话计数与活动时间。
+
+    消息插入和父会话更新由服务层一次提交；服务方法本身不接收用户 ID，因此端点的前置权限
+    检查是写入边界。返回值显式转成字典以避免异步 ORM 序列化问题。
     """
     conversation_service = ConversationService(db)
 
@@ -284,8 +302,10 @@ async def update_conversation_message(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    更新对话中的单条消息
+    """校验父会话归属后局部更新其中一条消息。
+
+    服务层继续确认消息属于该会话，把 Schema 的 ``user_feedback`` 适配为 ORM ``feedback``，
+    并与会话活动时间一次提交；未命中返回 404。
     """
     conversation_service = ConversationService(db)
 
@@ -325,8 +345,10 @@ async def delete_conversation_message(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    删除对话中的单条消息
+    """校验父会话归属后删除其中一条消息。
+
+    服务层核对消息与会话关联，在同一事务中删除消息、递减且不低于零的计数并刷新活动时间；
+    消息不属于该会话时返回 404。
     """
     conversation_service = ConversationService(db)
 

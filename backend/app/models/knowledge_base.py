@@ -1,5 +1,8 @@
 """
-用于组织文档和信息的知识库模型
+知识库与常见问题数据库模型。
+
+知识库通过一对多关系组织上传文档，并缓存文档数量用于列表展示；FAQ 可独立存在，也可
+关联某个知识库，同时记录浏览和有用性反馈计数。向量分块不保存在这两个模型中。
 """
 from sqlalchemy import Column, String, Text, JSON, Integer, Boolean, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID

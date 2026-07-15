@@ -1,5 +1,9 @@
 """
-    请求/响应验证的简历评估方案
+简历评价请求、AI 原始结果、数据库响应和前端结果 Schema。
+
+评价链存在两次结构转换：Dify 返回 ``AIEvaluationResult`` 风格的混合字段名，服务层将其
+规范化为 ``ResumeEvaluationResult``；数据库历史列表则使用包含文件与关联信息的
+``ResumeEvaluationResponse``。这些模型只验证形状，不执行评分。
 """
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -8,7 +12,8 @@ from uuid import UUID
 
 
 class EvaluationMetric(BaseModel):
-    """单个评价指标"""
+    """AI 对一个评价维度给出的得分、满分和可解释理由。"""
+
     name: str = Field(..., description="指标名称")
     score: float = Field(..., description="得分")
     max: float = Field(..., description="满分")
@@ -16,14 +21,17 @@ class EvaluationMetric(BaseModel):
 
 
 class ResumeEvaluationCreate(BaseModel):
-    """创建简历评价的请求"""
+    """发起评价时关联 JD、可选评分标准和对话上下文。"""
+
     job_description_id: UUID = Field(..., description="关联的JD ID")
     scoring_criteria_id: Optional[UUID] = Field(None, description="评分标准ID")
     conversation_id: Optional[str] = Field(None, description="对话ID")
 
 
 class ResumeEvaluationUpdate(BaseModel):
-    """更新简历评价的请求"""
+    """人工修正候选人信息或评价结果时使用的局部更新字段。"""
+
+    # 候选人画像
     candidate_name: Optional[str] = None
     candidate_position: Optional[str] = None
     candidate_age: Optional[int] = None
@@ -31,12 +39,16 @@ class ResumeEvaluationUpdate(BaseModel):
     work_years: Optional[float] = None
     education_level: Optional[str] = None
     school: Optional[str] = None
+
+    # 可人工调整的评价数据
     total_score: Optional[float] = None
     evaluation_metrics: Optional[List[EvaluationMetric]] = None
 
 
 class ResumeEvaluationResponse(BaseModel):
-    """简历评价响应"""
+    """数据库评价记录的公开投影，主要用于历史列表和详情。"""
+
+    # 原始附件和提取文本
     id: UUID
     original_filename: str
     file_type: str

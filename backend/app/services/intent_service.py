@@ -1,5 +1,9 @@
 """
-意图分类服务：对用户查询进行分类并返回前端路由
+自然语言意图分类与前端路由服务。
+
+分类采用两级策略：先用关键词做低成本快速匹配，未命中时才初始化 ``LLMService`` 并要求
+模型在固定标签中选择。知识库问答意图还会调用 ``KBSelectionService`` 选择最相关资源，
+最终统一返回意图、前端路径、原问题和可选知识库 ID。
 """
 import logging
 from typing import Dict, Any, Optional
@@ -13,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class IntentService:
-    """意图分类和路由服务"""
+    """把自然语言分类为稳定意图，并映射到前端路由和领域处理器。"""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -49,6 +53,7 @@ class IntentService:
         Returns:
             匹配到的意图标签，如果未匹配则返回None
         """
+        # 关键词列表有顺序：查询同时命中多个领域时，前面的意图先返回，不再继续比较。
         q = query.lower()
         for intent, words in self.keywords:
             for w in words:
@@ -80,12 +85,14 @@ class IntentService:
         )
         
         try:
+            # 延迟初始化：只有关键词规则无法识别时才创建 LLM 客户端，减少普通请求开销。
             if self.llm_service is None:
                 self.llm_service = LLMService()
             result = await self.llm_service.generate_response(prompt)
             intent = result.strip().lower()
-            
-            # 清理意图，确保为已知意图
+
+            # 模型输出是不可信自由文本。先检查精确标签，再用有限关键词做标准化，
+            # 绝不把任意模型文本直接当作前端路由。
             if intent not in self.intent_routes:
                 # 尝试简单的标准化处理
                 if "jd" in intent:
@@ -100,12 +107,12 @@ class IntentService:
                     return "email_notification"
                 if "kb" in intent or "知识" in intent or "问答" in intent:
                     return "kb_qa"
-                # 默认返回知识库问答
+                # 无法标准化的模型输出安全降级到知识库问答，而不是跳转到未知路径。
                 return "kb_qa"
             return intent
         except Exception as e:
             logger.error(f"LLM意图分类失败: {e}")
-            # 失败时默认返回知识库问答
+            # LLM 配置、网络或响应错误都不阻断路由请求，统一回到默认问答页。
             return "kb_qa"
 
     async def classify_intent(self, query: str) -> str:
@@ -118,15 +125,15 @@ class IntentService:
         Returns:
             分类后的意图标签
         """
+        # 空输入不调用关键词或 LLM，直接选择系统默认意图。
         if not query:
             return "kb_qa"
 
-        # 首先尝试快速关键词匹配
+        # 关键词命中时避免一次外部模型调用；只有未命中才进入较慢且可能失败的 LLM 路径。
         intent = self.classify_intent_fast(query)
         if intent:
             return intent
-            
-        # 快速匹配失败时使用LLM分类
+
         return await self.classify_intent_with_llm(query)
 
     async def get_route_for_intent(self, intent: str, query: str, user_id: UUID) -> Dict[str, Any]:
@@ -141,9 +148,10 @@ class IntentService:
         Returns:
             包含路由和意图信息的字典
         """
+        # 路由只能来自固定映射；未知 intent 同样落到知识库问答路径。
         route = self.intent_routes.get(intent, self.intent_routes["kb_qa"])
-        
-        # 如果是知识库问答，使用KBSelectionService自动选择知识库
+
+        # 只有知识库问答需要进一步选择具体资源，其他业务页由用户进入后再提供参数。
         kb_id = None
         if intent == "kb_qa":
             try:
@@ -153,9 +161,11 @@ class IntentService:
                     user_id=user_id,
                     max_candidates=200,
                 )
+                # 选择服务已把 LLM 返回 id 反查为当前用户候选集合中的可信知识库 id。
                 kb_id = result["knowledge_base_id"]
             except Exception as e:
                 logger.error(f"知识库选择失败: {e}")
+                # 选择失败仍返回问答路由，只是不预选知识库，由前端或后续流程让用户选择。
                 kb_id = None
 
         return {

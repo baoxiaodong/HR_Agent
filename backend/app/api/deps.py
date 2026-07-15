@@ -1,5 +1,8 @@
 """
-API依赖项 - 认证和授权
+FastAPI 认证与授权依赖。
+
+认证依赖负责还原并校验当前用户，授权来源包括 ``current_user.role`` 字段、
+超级用户标志和角色关联表查询。
 """
 from typing import Generator, Optional, List
 from fastapi import Depends, HTTPException, status
@@ -16,14 +19,13 @@ from app.services.user_service import UserService
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
 
+# 认证链：读取 Bearer Token -> 解码用户 ID -> 查询数据库用户 -> 校验启用状态。
 
 async def get_current_user(
     db: AsyncSession = Depends(get_db),
     token: str = Depends(oauth2_scheme)
 ) -> User:
-    """
-    获取当前认证用户
-    """
+    """从访问令牌还原当前用户；令牌或用户无效时中断后续依赖链。"""
     import logging
     logger = logging.getLogger(__name__)
     
@@ -80,9 +82,7 @@ async def get_current_user(
 async def get_current_hr_user(
     current_user: User = Depends(get_current_user),
 ) -> User:
-    """
-    获取当前HR用户（HR经理或HR专员）
-    """
+    """允许 HR 角色访问，并按现有规则对超级用户标志直接放行。"""
     from app.models.user import UserRole
     
     if current_user.role not in [UserRole.HR_MANAGER, UserRole.HR_SPECIALIST] and not current_user.is_superuser:
@@ -95,9 +95,7 @@ async def get_current_hr_user(
 async def get_current_superuser(
     current_user: User = Depends(get_current_user),
 ) -> User:
-    """
-    获取当前超级管理员用户
-    """
+    """仅允许带有超级用户标志的用户访问，否则返回 403。"""
     if not current_user.is_superuser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -110,6 +108,12 @@ async def get_current_admin_by_role(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> User:
+    """
+    通过用户-角色关联表校验“超级管理员”角色。
+
+    查询只过滤 ``Role.is_active``，不检查关联记录启用状态；超级用户不自动绕过。
+    未关联目标角色时返回 403。
+    """
     query = (
         select(Role)
         .join(UserRoleAssociation, Role.id == UserRoleAssociation.role_id)
@@ -126,6 +130,12 @@ async def get_current_admin_by_role(
 
 
 def require_any_role_names(required: List[str]):
+    """
+    创建按角色名称校验的依赖，命中任一有效关联角色即可放行。
+
+    查询只过滤 ``Role.is_active``，不检查关联记录启用状态；超级用户不自动绕过。
+    无匹配角色时返回 403。
+    """
     async def dependency(
         db: AsyncSession = Depends(get_db),
         current_user: User = Depends(get_current_user),

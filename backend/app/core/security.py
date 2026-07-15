@@ -1,5 +1,9 @@
 """
-用于密码哈希和JWT令牌的安全工具
+密码与 JWT 安全工具。
+
+密码只以 bcrypt 哈希形式存储和比对；登录成功后，用户标识等载荷会被复制、补充过期
+时间，再使用项目密钥签名为 JWT。这里负责纯粹的加密转换，数据库用户查询和权限判断
+分别由用户服务及 ``app.api.deps`` 负责。
 """
 import logging
 from datetime import datetime, timedelta

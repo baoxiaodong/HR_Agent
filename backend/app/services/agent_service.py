@@ -1,6 +1,9 @@
 """
-轻量 HR Agent 服务
-    第一版聚焦工具编排：理解用户 HR 需求，并按意图调用 JD 生成、简历筛选等工具。
+HR Agent 编排层。
+
+接收对话、附件与确认数据，组织意图规划、Skill/招聘工具调用和流式事件；
+按需读取会话记忆，并委托各业务服务完成 JD、评分标准、简历评价、面试计划、
+试卷等资源的持久化。本模块负责跨服务流程编排，不替代各领域服务内部的业务实现。
 """
 import json
 import logging
@@ -68,7 +71,7 @@ class ReActDecision:
 
 
 class AgentService:
-    """HR Agent 编排服务"""
+    """驱动意图识别、需求确认、工具规划与招聘领域工作流的有状态编排。"""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -78,6 +81,8 @@ class AgentService:
         self.tool_registry = self._build_tool_registry()
         self.email_send_service = EmailSendService(db)
         self.llm_service = None
+
+    # ---------- 工具注册与意图规划 ----------
 
     def _build_tool_registry(self) -> Dict[str, AgentToolSpec]:
         """声明 Agent 能自主规划的工具和前置条件"""
@@ -148,8 +153,10 @@ class AgentService:
         return build_default_skill_dispatcher()
 
     def _classify_agent_intent(self, message: str, attachments: List[Dict[str, Any]]) -> str:
-        """轻量意图分类：优先规则和附件上下文，不为路由单独调用大模型。"""
+        """按固定优先级用文本规则和附件上下文选择候选意图，不调用 LLM。"""
         lowered = message.lower()
+
+        # 删除和编辑规则优先于通用 IntentService，避免“删除 JD”被关键词 JD 提前判为生成任务。
         if re.search(r"删除|删掉|移除|清理", message) and re.search(r"jd|职位|岗位|简历|候选人|面试|试卷|考试", lowered):
             return "resource_delete"
         if self._is_criteria_edit_request(message):
@@ -157,10 +164,12 @@ class AgentService:
         if self._is_jd_edit_request(message):
             return "jd_edit"
 
+        # 先复用低成本领域关键词；只有已注册工具的意图才接受，避免路由到不存在的执行器。
         fast_intent = self.intent_service.classify_intent_fast(message)
         if fast_intent in self.tool_registry:
             return fast_intent
 
+        # 文本含义不足时，再用附件类型和动作词组合判断简历/试卷任务。
         if self._filter_attachments(attachments, {"pdf", "doc", "docx"}) and re.search(r"评分|筛选|匹配|简历|候选人", message):
             return "resume_screening"
         if self._filter_attachments(attachments, {"pdf", "doc", "docx", "txt", "md"}) and re.search(r"试卷|考试|出题|题目|笔试", message):
@@ -229,15 +238,18 @@ class AgentService:
         }
 
     def _normalize_attachments(self, attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """收窄客户端附件元数据，供意图判断使用；本方法不读取或保存文件内容。"""
         normalized = []
         for item in attachments:
             name = str(item.get("name") or "").strip()
             if not name:
+                # 没有名称就无法可靠判断扩展名，直接排除该附件元数据。
                 continue
             normalized.append({
                 "name": name,
                 "size": item.get("size"),
                 "content_type": item.get("content_type"),
+                # 扩展名统一小写，后续可直接与工具允许集合比较。
                 "extension": name.rsplit(".", 1)[-1].lower() if "." in name else "",
             })
         return normalized
@@ -275,10 +287,11 @@ class AgentService:
         attachments: List[Dict[str, Any]],
         memory_context: str = "",
     ) -> Dict[str, Any]:
-        """使用受控 ReAct 决策选择下一步动作。
+        """根据消息、标准化附件和会话记忆生成受控动作计划。
 
-        这里的 ReAct 是有限动作空间版本：模型只能在 chat / use_tool / ask_user
-        中选择，并且 use_tool 只能选择 tool_registry 声明过的业务工具。
+        先把已注册工具和有限动作空间交给大模型，再校验动作及意图是否允许；
+        返回供入口路由使用的计划字典。模型调用、JSON 解析或校验失败时改用本地
+        意图规则兜底；除延迟初始化 LLM 客户端和调用模型外，不写入业务数据。
         """
         attachment_text = "无"
         if attachments:
@@ -328,10 +341,13 @@ class AgentService:
             f"附件：{attachment_text}"
         )
         try:
+            # 仅在规则计划未命中时初始化 LLM；模型只生成计划，不直接执行工具。
             if self.llm_service is None:
                 self.llm_service = LLMService()
             response = await self.llm_service.generate_response(prompt)
             planned = self._safe_json_loads(response)
+
+            # 将模型自由输出收窄为 chat/use_tool/ask_user 三种动作；ask_user 仍进入工具链的前置条件分支。
             action = str(planned.get("action") or planned.get("mode") or "").lower()
             intent = str(planned.get("intent") or "").strip()
             if action == "use_tool":
@@ -341,6 +357,8 @@ class AgentService:
             else:
                 mode = "chat"
                 action = "chat"
+
+            # intent 必须存在于注册表或 general 白名单；模型不能凭空指定函数名、路由或任意工具。
             if mode in {"chat", "tool"} and intent in self._allowed_intents():
                 decision = ReActDecision(
                     mode=mode,
@@ -359,6 +377,8 @@ class AgentService:
         except Exception as exc:
             logger.warning("Agent ReAct 决策失败，使用规则兜底: %s", exc)
 
+        # JSON 非法、模型异常或白名单校验未通过都会落到确定性本地分类；
+        # 只有本地结果命中已注册工具时才允许进入执行模式，否则保持普通聊天。
         fallback_intent = self._classify_agent_intent(message, attachments)
         fallback_action = "use_tool" if fallback_intent in self.tool_registry else "chat"
         decision = ReActDecision(
@@ -371,6 +391,8 @@ class AgentService:
         )
         return self._decision_to_plan(decision)
 
+    # ---------- 对话入口与流式事件 ----------
+
     async def chat(
         self,
         message: str,
@@ -381,9 +403,18 @@ class AgentService:
         attachments: Optional[List[Dict[str, Any]]] = None,
         agent_plan: Optional[Dict[str, Any]] = None,
     ) -> AgentChatResponse:
-        """处理用户消息并执行招聘 Agent 任务"""
+        """处理一次非流式 HR Agent 对话并返回统一响应。
+
+        输入包含用户消息、归属用户、可选会话、附件、确认数据和复用计划。函数先读取
+        会话记忆，再按“确认数据 -> 复用传入 agent_plan -> 规则计划 -> 大模型计划”的
+        优先级确定意图，并在检查各工具前置条件后路由到对话、编辑、删除、Skill 或招聘
+        执行链。返回步骤、产物及建议组成的 ``AgentChatResponse``；只有进入下游执行链
+        时才可能生成、更新、删除或持久化业务资源，单纯规划和追问分支不写业务数据。
+        """
+        # 1. 统一附件结构并读取当前用户可见的会话记忆，供规则和模型理解指代。
         normalized_attachments = self._normalize_attachments(attachments or [])
         memory_context = await self._build_conversation_memory(conversation_id, user_id, message)
+        # 2. 已确认数据直接恢复对应工具；否则先走确定性规则，再调用受控规划器。
         if confirmed_requirements:
             confirmation_action = str(confirmed_requirements.get("action") or "").strip()
             confirmed_skill = self.skill_dispatcher.match_confirmation_action(confirmation_action) if confirmation_action else None
@@ -412,6 +443,7 @@ class AgentService:
         route_result = self._route_for_intent(intent, message)
         selected_tool = self.tool_registry.get(intent)
 
+        # 3. 按意图检查附件、候选人或确认信息；满足条件后才委托具体业务服务执行。
         if agent_plan["mode"] == "chat" or intent == "general":
             reply = self._clean_optional_value(agent_plan.get("reply")) or self._fallback_message("general", message)
             return AgentChatResponse(
@@ -775,6 +807,8 @@ class AgentService:
             requires_confirmation=True,
         )
 
+    # ---------- 招聘业务工具执行 ----------
+
     async def _run_recruitment_agent(
         self,
         message: str,
@@ -783,6 +817,13 @@ class AgentService:
         parsed_requirements: Optional[Dict[str, Any]] = None,
         user_id: Optional[UUID] = None,
     ) -> AgentChatResponse:
+        """执行确认后的非流式 JD 与评分标准生成链。
+
+        输入原始需求、可选结构化需求、会话标识和用户标识；需求解析失败时使用本地
+        规则兜底，JD、评分标准生成或保存中的未处理异常向上抛出。提供 ``user_id`` 时
+        两类资源分别保存，JD 保存后的后续失败不会回滚 JD；未提供时只生成内容，不
+        持久化业务资源。返回包含执行步骤和生成产物的统一响应。
+        """
         steps: List[AgentStep] = [
             self._planning_step(self.tool_registry.get("jd"), "招聘信息已确认，开始执行生成链路。"),
             AgentStep(id="parse", title="解析招聘需求", status="running", tool="parse_requirements"),
@@ -792,10 +833,12 @@ class AgentService:
         ]
         artifacts: List[AgentArtifact] = []
 
+        # 结构化需求可能来自已确认表单；未提供时才重新解析自然语言。
         parsed = parsed_requirements or await self._parse_requirements(message, conversation_id)
         steps[1] = steps[1].model_copy(update={"status": "completed", "detail": self._brief_requirements(parsed)})
         artifacts.append(AgentArtifact(type="requirements", title="结构化招聘需求", content=parsed))
 
+        # 先生成 JD 内容；有 user_id 时才调用远程 JD 服务持久化，匿名/预览路径只保留内存产物。
         steps[2] = steps[2].model_copy(update={"status": "running"})
         jd_content = await self._generate_jd(message, parsed, conversation_id)
         saved_jd = None
@@ -817,6 +860,8 @@ class AgentService:
         ))
 
         saved_criteria = None
+        # 评分标准依赖已生成 JD；它是第二个独立远程生成/保存阶段。
+        # 如果 JD 已保存而此阶段失败，没有跨服务事务自动删除前面的 JD。
         steps[3] = steps[3].model_copy(update={"status": "running", "detail": "正在基于 JD 生成评分标准..."})
         criteria_content = await self._generate_scoring_criteria(jd_content, parsed, conversation_id)
         if user_id:
@@ -858,6 +903,8 @@ class AgentService:
             ],
         )
 
+    # ---------- 对话入口与流式事件（续） ----------
+
     async def stream_chat_agent(
         self,
         message: str,
@@ -867,7 +914,14 @@ class AgentService:
         confirmed_requirements: Optional[Dict[str, Any]] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """流式处理普通 Agent 聊天：先推送思考状态，再返回最终规划/回复。"""
+        """以事件流处理 Agent 对话。
+
+        输入与 ``chat`` 基本一致。先发出 thinking 事件并构建记忆和计划；普通对话直接
+        流式调用 LLM，失败时按文本切片输出规划回复；JD/评分标准编辑和邮件草稿阶段走
+        专用流，其他意图复用 ``chat`` 后依次发出 plan、delta、final。生成器产出事件
+        字典；下游执行分支可能继承 ``chat`` 的资源写入副作用，普通对话流本身不写业务数据。
+        """
+        # 先让前端进入可见的思考状态，再执行可能较慢的记忆查询和意图规划。
         thinking_response = AgentChatResponse(
             message="我正在理解你的需求。",
             intent="thinking",
@@ -923,6 +977,7 @@ class AgentService:
                         full_text += delta
                         yield {"type": "delta", "delta": delta}
                 except Exception as exc:
+                    # 普通聊天流失败时只回退到已有规划回复，不触发招聘工具。
                     logger.warning("Agent 普通聊天原生流式失败，使用规划回复兜底: %s", exc)
                     fallback_reply = self._clean_optional_value(agent_plan.get("reply")) or self._fallback_message("general", message)
                     async for delta in self._stream_text(fallback_reply):
@@ -1008,6 +1063,12 @@ class AgentService:
         conversation_id: Optional[str],
         memory_context: str,
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        """以事件流完成“解析修改要求 -> 定位 JD -> 模型改写 -> 远程更新”。
+
+        候选目标始终从当前用户的会话产物和 JD 列表中获取；多候选或修改要求不足时只返回
+        确认事件，不执行写操作。唯一命中后由领域服务再次携带 ``user_id`` 读取和更新，模型
+        只生成新版正文，不能决定资源 ID。更新异常会转为 final 失败响应。
+        """
         selected_tool = self.tool_registry.get("jd_edit")
         edit_request = await self._parse_jd_edit_request(message, memory_context)
         steps = [
@@ -1158,6 +1219,12 @@ class AgentService:
         conversation_id: Optional[str],
         memory_context: str,
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        """流式定位并更新一条评分标准，阶段协议与 JD 编辑保持一致。
+
+        目标来自当前用户的待确认上下文、近期产物或领域服务列表；多个候选时暂停写入并要求
+        用户选择。模型只改写内容，原有结构化字段由更新载荷保留，实际归属校验与持久化由
+        ``ScoringCriteriaService`` 完成。
+        """
         selected_tool = self.tool_registry.get("criteria_edit")
         edit_request = await self._parse_criteria_edit_request(message, memory_context)
         steps = [
@@ -1317,6 +1384,12 @@ class AgentService:
         memory_context: str,
         confirmed_requirements: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        """执行邮件 Skill 的草稿阶段，并把模型文本转换为统一 Agent 事件。
+
+        先读取已注册 bundle 的 ``draft`` 阶段说明并流式生成；模型失败时运行阶段脚本模板
+        降级。生成结果通过内部字段 ``__draft_text`` 交给 Skill 响应构造，但本阶段只产出草稿，
+        不发送邮件；真正 SMTP 副作用必须由后续确认阶段触发。
+        """
         bundle = self.skill_dispatcher.get_bundle(intent)
         selected_tool = self.tool_registry.get(intent)
         plan_response = AgentChatResponse(
@@ -1398,7 +1471,14 @@ class AgentService:
         memory_context: str,
         confirmed_requirements: Optional[Dict[str, Any]] = None,
     ) -> AgentChatResponse:
+        """将已注册意图路由到 Skill bundle 的当前阶段。
+
+        bundle 根据确认数据选择 draft、confirm 或 send 等阶段，再向阶段脚本注入受控服务对象
+        和用户上下文。阶段脚本返回普通字典，本函数只负责执行与响应适配；是否产生邮件等
+        外部副作用由被选中的阶段实现决定。
+        """
         bundle = self.skill_dispatcher.get_bundle(intent)
+        # 阶段名由 manifest 和确认动作共同决定，模型不能直接传入任意 Python 模块名。
         phase_name = bundle.resolve_phase(confirmed_requirements)
         phase = bundle.get_phase(phase_name)
         result = await phase.run(
@@ -1453,6 +1533,8 @@ class AgentService:
             missing_fields=[str(item) for item in (result.get("missing_fields") or [])],
         )
 
+    # ---------- 招聘业务工具执行（流式） ----------
+
     async def stream_recruitment_agent(
         self,
         message: str,
@@ -1460,7 +1542,14 @@ class AgentService:
         conversation_id: Optional[str],
         confirmed_requirements: Dict[str, Any],
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """流式执行确认后的招聘 Agent 任务，向前端推送真实阶段进度"""
+        """流式执行已确认的 JD 与评分标准生成链。
+
+        输入用户、会话、原始消息和确认后的招聘字段。函数按 JD 生成、JD 保存、评分
+        标准生成、评分标准保存的固定顺序发送 progress、delta、artifact 和 final 事件。
+        两次流式生成在空结果时同步回退，失败前已有部分内容时继续使用该部分；未处理的
+        同步回退或保存异常才向上抛出。两类资源没有统一事务，JD 已保存后评分标准生成
+        或保存失败不会回滚 JD。
+        """
         parsed = self._normalize_requirements(confirmed_requirements, message)
         route = "/recruitment/jd-generator"
         steps: List[AgentStep] = [
@@ -1477,6 +1566,7 @@ class AgentService:
 
         yield self._stream_event("progress", "已确认招聘需求，准备生成 JD。", steps, artifacts)
 
+        # 生成内容与持久化严格串行，确保评分标准能够关联已保存的 JD。
         steps[2] = steps[2].model_copy(update={"status": "running", "detail": "正在调用大模型生成 JD..."})
         yield self._stream_event("progress", "正在生成岗位 JD。", steps, artifacts)
         yield {"type": "delta", "delta": "## 岗位 JD\n\n", "section": "jd"}
@@ -1566,7 +1656,14 @@ class AgentService:
         files: List[Dict[str, Any]],
         conversation_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """批量筛选简历并推送真实进度"""
+        """按指定 JD 顺序评价多份简历并流式汇报结果。
+
+        输入用户、JD 标识及包含文件名和二进制内容的文件列表。每份简历交给评价服务
+        解析、评分和保存，单份失败会记录错误并继续后续文件；随后按得分排序并生成招聘
+        闭环建议。产出 progress、delta、artifact 和 final 事件；成功项的持久化由评价
+        服务完成，因此批次可能出现部分成功、部分失败。评价服务先把简历文件落盘，再
+        保存评价记录；记录保存失败时，已经落盘的文件可能保留。
+        """
         total = len(files)
         results: List[Dict[str, Any]] = []
         steps = [
@@ -1584,6 +1681,7 @@ class AgentService:
         yield {"type": "delta", "delta": "## 简历评分结果\n\n", "section": "resume_screening"}
 
         evaluation_service = ResumeEvaluationService(self.db)
+        # 单份异常隔离在循环内，避免一份坏文件中断整批处理。
         for index, file_info in enumerate(files, start=1):
             filename = file_info["filename"]
             steps[1] = steps[1].model_copy(update={
@@ -1720,7 +1818,14 @@ class AgentService:
         resume_evaluation_id: UUID,
         conversation_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """根据已评分简历生成并保存面试计划"""
+        """根据一条已评分简历生成并保存面试计划。
+
+        输入当前用户、简历评价 ID 和可选会话。先校验并读取简历及关联 JD，再流式生成
+        计划：空结果时同步回退，失败前已有部分内容时继续使用该部分。随后通过远程服务
+        保存面试计划，再把本地候选人状态改为面试并 commit；同步回退、保存或 commit
+        等未处理异常会向上抛出。远程面试计划保存后，本地状态 commit 失败不会撤销
+        已保存的计划。
+        """
         steps = [
             AgentStep(id="load_resume", title="读取候选人资料", status="running", detail="正在读取简历评分记录"),
             AgentStep(id="generate_plan", title="生成面试计划", status="pending", tool="generate_interview_plan"),
@@ -1754,6 +1859,7 @@ class AgentService:
         ]
         yield self._tool_stream_event("artifact", "面试计划已生成，正在保存。", "interview_plan", "/recruitment/smart-interview", steps, artifacts)
 
+        # 面试计划创建成功后，同一流程再推进候选人状态并显式提交。
         steps[2] = steps[2].model_copy(update={"status": "running", "detail": "正在保存到面试计划列表..."})
         saved_plan = await InterviewPlanService(self.db).create_interview_plan(
             user_id=user_id,
@@ -1790,7 +1896,14 @@ class AgentService:
         exam_requirements: Dict[str, Any],
         conversation_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """生成并保存考试试卷"""
+        """根据结构化考试配置生成、修补并保存试卷。
+
+        输入用户、考试配置和可选会话。先归一化配置并补充面试方案上下文，再流式收集
+        原始题目：空结果时同步回退，失败前已有部分内容时继续使用该部分；之后按缺失
+        题型尝试补题并交给 ``ExamService`` 保存。该服务先提交试卷主记录，再另行提交
+        结构化题目，因此题目保存失败时主记录可能已经保留；未处理的同步回退、补题或
+        保存异常会向上抛出。
+        """
         exam = self._normalize_exam_requirements(exam_requirements)
         exam = await self._hydrate_exam_interview_context(exam, user_id, conversation_id)
         steps = [
@@ -1806,6 +1919,7 @@ class AgentService:
         display_exam_content = ""
         pending_exam_buffer = ""
         question_index = 1
+        # 原始内容用于解析和持久化，展示内容单独格式化后持续推送给前端。
         async for raw_delta in self._generate_exam_content_stream(exam_service, exam, user_id, conversation_id):
             raw_exam_content += raw_delta
             pending_exam_buffer += raw_delta
@@ -1826,6 +1940,7 @@ class AgentService:
             display_exam_content += display_delta
             yield {"type": "delta", "delta": display_delta, "section": "exam_generate"}
 
+        # 首轮生成结束后仅补齐缺失题型，再把修补内容并入同一份最终试卷。
         repair_content = await self._generate_missing_exam_questions(
             exam_service=exam_service,
             exam=exam,
@@ -1884,6 +1999,11 @@ class AgentService:
         user_id: UUID,
         conversation_id: Optional[str],
     ) -> AsyncGenerator[str, None]:
+        """调用考试服务流式生成原始题目协议，空结果时改用同步请求。
+
+        Dify/SSE 块先规范化，再提取文本并与已累计内容去重。流式过程异常但已有内容时保留
+        部分结果；只有完全没有有效文本才同步重试。该函数不解析题目也不保存试卷。
+        """
         full_text = ""
         special_requirements = self._build_exam_special_requirements(exam)
         try:
@@ -1940,6 +2060,12 @@ class AgentService:
         user_id: UUID,
         conversation_id: Optional[str],
     ) -> str:
+        """解析首轮结果并仅为缺失题型发起一次补题请求。
+
+        缺口按配置题量减去可解析题量计算，补题提示携带部分已生成内容以降低重复概率；补题
+        仍不足时只记录警告并返回现有结果，不继续无限重试。返回文本由上层并入最终试卷，
+        本函数不执行保存。
+        """
         missing_counts = self._missing_exam_question_counts(exam_service, exam, existing_content)
         if not any(missing_counts.values()):
             return ""
@@ -2108,6 +2234,11 @@ class AgentService:
         user_id: UUID,
         conversation_id: Optional[str],
     ) -> Dict[str, Any]:
+        """为“基于刚才面试方案出题”的配置补入可信会话产物。
+
+        已携带上下文或并非跟进请求时原样返回；否则只在当前用户会话的近期 Agent 产物中
+        查找面试计划。这里不把模型生成的任意 ID 当作资源，只复用已保存产物的摘要与正文。
+        """
         if exam.get("interview_plan_context"):
             return exam
         text = " ".join([
@@ -2152,7 +2283,14 @@ class AgentService:
         files: List[Dict[str, Any]],
         conversation_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """上传并处理文档后，基于文档生成并保存考试试卷"""
+        """保存上传文档并基于其内容生成试卷事件流。
+
+        输入考试配置和包含文件名、二进制内容的文档列表。函数先按哈希复用或落盘并
+        创建 ``Document``，缺少提取文本时解析后 commit、refresh；随后把文档 ID 注入
+        配置并复用 ``stream_exam_generation``。解析失败会中止后续出题，但此前已落盘
+        或提交的文件、Document 记录及前面成功处理的文件不会回滚；成功进入下游后还会
+        产生最终试卷持久化副作用。
+        """
         exam = self._normalize_exam_requirements(exam_requirements)
         total = len(files)
         steps = [
@@ -2187,6 +2325,7 @@ class AgentService:
             )
 
         knowledge_files: List[Dict[str, Any]] = []
+        # 文档逐个持久化和解析，只有得到可用文本后才加入出题知识文件列表。
         for index, file_info in enumerate(files, start=1):
             filename = file_info["filename"]
             steps[1] = steps[1].model_copy(update={"status": "running", "detail": f"正在解析第 {index}/{total} 个文档：{filename}"})
@@ -2215,6 +2354,7 @@ class AgentService:
         ))
         yield self._tool_stream_event("artifact", "文档解析完成，开始基于文档生成试卷。", "exam_generate", "/training/exam-generator", steps, artifacts)
 
+        # 复用标准试卷生成链，并把文档阶段的步骤和产物合并到下游事件。
         async for event in self.stream_exam_generation(
             user_id=user_id,
             exam_requirements={**exam, "knowledge_files": knowledge_files},
@@ -2274,6 +2414,8 @@ class AgentService:
             ).model_dump(),
         }
 
+    # ---------- 会话记忆与候选对象解析 ----------
+
     async def _build_conversation_memory(
         self,
         conversation_id: Optional[str],
@@ -2282,6 +2424,12 @@ class AgentService:
         limit: int = 12,
         max_chars: int = 6000,
     ) -> str:
+        """读取当前用户拥有的会话近期消息并整理为提示词记忆。
+
+        输入会话 ID、用户 ID、当前消息及数量/字符上限。函数先校验 UUID 和会话归属，
+        再按时间恢复最近消息顺序，过滤空内容及可能重复的当前用户消息，并截断为纯文本。
+        返回记忆字符串；会话无效、无权限或查询异常时返回空串，整个过程只读数据库。
+        """
         if not conversation_id:
             return ""
         try:
@@ -2359,6 +2507,13 @@ class AgentService:
         user_id: UUID,
         memory_context: str = "",
     ) -> Dict[str, Any]:
+        """在当前用户最近的已评分简历中解析面试计划目标。
+
+        候选列表先由数据库按 ``user_id`` 限定，再作为紧凑文本交给 LLM 做指代匹配。模型
+        返回的 ``candidate_id`` 不能直接信任，必须经 ``_normalize_candidate_resolution``
+        回到可信候选集合反查；模型失败时用姓名和文件名规则降级。
+        """
+        # 候选数据来自受用户条件约束的 ORM 查询，是后续校验模型输出的可信集合。
         candidates = await self._recent_resume_candidates(user_id)
         candidate_text = "\n".join(
             (
@@ -2401,6 +2556,11 @@ class AgentService:
             return self._fallback_candidate_resolution(message, candidates)
 
     async def _recent_resume_candidates(self, user_id: UUID, limit: int = 50) -> List[Dict[str, Any]]:
+        """读取当前用户最近的评价记录并压缩为候选匹配所需字段。
+
+        返回字典而非 ORM 实体，避免把完整简历正文和其他敏感字段发送给候选解析模型；
+        ``user_id`` 固定在 SQL 条件中，保证跨用户记录不会进入候选集合。
+        """
         result = await self.db.execute(
             select(ResumeEvaluation)
             .where(ResumeEvaluation.user_id == user_id)
@@ -2424,8 +2584,14 @@ class AgentService:
         candidates: List[Dict[str, Any]],
         message: str,
     ) -> Dict[str, Any]:
+        """把 LLM 自由 JSON 收窄为受控状态，并校验候选 ID 的来源。
+
+        只有 ``candidate_id`` 精确存在于可信候选列表时才返回 ``matched``；模型声称已匹配但
+        ID 不存在时会进入本地规则，而不是查询或操作该任意 ID。其他状态也只接受固定枚举。
+        """
         status = str(parsed.get("status") or "").strip().lower()
         candidate_id = self._clean_optional_value(parsed.get("candidate_id"))
+        # 使用数据库候选集合建立白名单，匹配后的姓名也取本地数据而不是模型输出。
         candidate_lookup = {item["id"]: item for item in candidates}
         if candidate_id and candidate_id in candidate_lookup:
             matched = candidate_lookup[candidate_id]
@@ -2527,6 +2693,12 @@ class AgentService:
         user_id: UUID,
         conversation_id: Optional[str],
     ) -> Dict[str, Any]:
+        """判断消息是否在承接最近一次简历筛选结果。
+
+        输入消息、用户和会话标识；仅对闭环跟进语句查询最近筛选分组，并按固定 60 分
+        阈值识别需要确认的低分项删除请求，或识别为高分项生成面试计划的请求。返回动作
+        及候选分组，缺少上下文时返回 ``missing_context``；只读取数据，不执行删除或生成。
+        """
         if not self._is_followup_resume_screening_loop_request(message):
             return {"action": None}
         groups = await self._recent_resume_screening_groups(conversation_id, user_id, threshold=60)
@@ -2696,6 +2868,8 @@ class AgentService:
             suggestions=["上传简历评分", "选择 JD 后开始评分", "查看历史评分"],
         )
 
+    # ---------- JD、评分标准编辑与资源删除 ----------
+
     async def _handle_jd_edit(
         self,
         message: str,
@@ -2704,6 +2878,13 @@ class AgentService:
         conversation_id: Optional[str],
         memory_context: str,
     ) -> AgentChatResponse:
+        """定位并修改一个已有 JD。
+
+        输入用户消息、用户、工具声明、会话和记忆。先解析目标与修改要求，再从当前会话
+        和近期资源中定位 JD；无目标、多候选或缺少修改点时只返回追问。唯一命中后读取
+        原内容、调用模型改写并通过 ``JobDescriptionService`` 更新原记录。返回统一响应；
+        更新成功会产生持久化副作用，异常会被转换为失败响应而不伪造成功产物。
+        """
         edit_request = await self._parse_jd_edit_request(message, memory_context)
         steps = [
             self._planning_step(selected_tool, "识别到 JD 修改请求，先定位目标 JD。"),
@@ -2826,6 +3007,13 @@ class AgentService:
         conversation_id: Optional[str],
         memory_context: str,
     ) -> AgentChatResponse:
+        """以非流式响应包装评分标准编辑事件流。
+
+        输入用户消息、用户、工具声明、会话和记忆；内部完整消费
+        ``_stream_criteria_edit_response``，其中会定位目标、收集修改要求、模型改写并通过
+        领域服务更新原记录。返回最后一个 final 响应；若事件流未给出 final，则返回重试
+        提示。持久化副作用只发生在委托流成功更新评分标准时。
+        """
         final_response = None
         async for event in self._stream_criteria_edit_response(message, user_id, conversation_id, memory_context):
             if event.get("type") == "final" and event.get("response"):
@@ -2841,6 +3029,11 @@ class AgentService:
         )
 
     async def _parse_jd_edit_request(self, message: str, memory_context: str = "") -> Dict[str, Any]:
+        """将自然语言 JD 修改请求拆为“目标关键词、修改说明、结构化字段”。
+
+        LLM 只负责语义提取，输出经 JSON 解析、空值清洗和泛化请求识别；若上一轮正在等待
+        修改要求，当前消息可直接作为 ``changes``。模型调用失败时转入正则规则解析，不写数据。
+        """
         prompt = (
             "你是 HR Agent 的 JD 修改请求解析器。请严格返回 JSON，不要解释。\n"
             "字段：keyword, changes, title, department, location, salary_range, experience_level, education, job_type, skills。\n"
@@ -2911,6 +3104,11 @@ class AgentService:
         }
 
     async def _parse_criteria_edit_request(self, message: str, memory_context: str = "") -> Dict[str, Any]:
+        """提取评分标准的目标关键词和具体修改要求。
+
+        返回值只是定位和改写提示，不包含可信资源 ID；目标 ID 必须在后续当前用户候选列表中
+        解析。LLM 异常、非 JSON 或空结果均回退本地规则。
+        """
         prompt = (
             "你是 HR Agent 的评分标准修改请求解析器。请严格返回 JSON，不要解释。\n"
             "字段：keyword, changes。\n"
@@ -2994,6 +3192,12 @@ class AgentService:
         conversation_id: Optional[str],
         keyword: str = "",
     ) -> List[Dict[str, Any]]:
+        """按待确认上下文、近期产物、完整 JD 列表的优先级定位目标。
+
+        所有数据源都带当前 ``user_id``；会话候选用于理解“第一个/最新的”等指代，领域列表
+        用于补充可搜索资源。多来源结果按 ID 去重，本函数只返回候选，不执行更新。
+        """
+        # 上一轮已锁定单个 JD 且用户只补充修改内容时，优先恢复该待确认目标。
         pending_target = await self._recent_pending_jd_edit_target(user_id, conversation_id)
         if pending_target and not keyword:
             return [pending_target]
@@ -3368,6 +3572,11 @@ class AgentService:
         user_id: UUID,
         conversation_id: Optional[str],
     ) -> Dict[str, Any]:
+        """把“基于刚才方案生成试卷”的指代解析为最近面试计划产物。
+
+        仅在规则识别为跟进请求后读取当前用户会话中的已保存产物；找不到时返回未匹配，
+        不凭空构造上下文。返回正文会被截断后注入出题需求，但资源本身不会在这里修改。
+        """
         if not self._is_followup_interview_exam_request(message):
             return {"matched": False}
         matches = await self._recent_generated_resources("interview", user_id, conversation_id, limit=20)
@@ -3390,9 +3599,18 @@ class AgentService:
         selected_tool: Optional[AgentToolSpec],
         conversation_id: Optional[str] = None,
     ) -> AgentChatResponse:
+        """解析、确认并执行招聘资源删除。
+
+        输入删除描述、用户、工具声明和可选会话。先处理最近筛选结果中的低分候选人确认，
+        再按上下文指代或资源类型/关键词查找目标。上下文指代分支会选择最近/第一个目标，
+        明确要求全部删除时保留全部上下文匹配；常规查询只有在多匹配且未要求全部删除时
+        才返回确认提示。实际删除会逐项返回成功/失败明细，允许部分成功且没有统一事务
+        回滚；删除 JD 前会逐条尽力删除关联评分标准，失败项不阻止 JD 删除并随结果返回。
+        """
         delete_request = await self._parse_delete_request(message)
         resource_type = delete_request.get("type")
         keyword = delete_request.get("keyword") or ""
+        # 低分候选人先返回确认动作；只有后续明确确认才进入真实删除。
         if (
             resource_type == "resume"
             and not delete_request.get("confirm_context_low_scores")
@@ -3431,6 +3649,7 @@ class AgentService:
                 keyword="低分候选人",
                 matched_from_context=True,
             )
+        # “这个/刚才”优先从当前会话产物定位，其余请求再查询完整资源列表匹配。
         context_first = bool(delete_request.get("context_reference")) and not keyword
         steps = [
             self._planning_step(selected_tool, "识别到删除类请求，准备定位目标资源。"),
@@ -3516,6 +3735,12 @@ class AgentService:
         )
 
     async def _parse_delete_request(self, message: str) -> Dict[str, Any]:
+        """把删除语句收窄为固定资源类型、关键词和确认标志。
+
+        LLM 不能返回可直接删除的资源 ID，只能选择 ``jd/resume/interview/exam`` 枚举并描述
+        匹配意图；非法类型或调用异常会回退本地规则。真正目标必须在当前用户资源列表或可信
+        会话产物中重新匹配，避免模型编造 ID 触发删除。
+        """
         prompt = (
             "你是 HR Agent 的删除请求解析器。请从用户消息中识别要删除的招聘资源，并严格返回 JSON，不要解释。\n"
             "resource_type 只能是 jd、resume、interview、exam、unknown。\n"
@@ -3610,6 +3835,12 @@ class AgentService:
         conversation_id: Optional[str] = None,
         limit: int = 12,
     ) -> List[Dict[str, Any]]:
+        """从当前用户的助手消息上下文恢复最近已保存的 Agent 产物。
+
+        查询先通过 ``Conversation.user_id`` 固定用户隔离，再从 ``agent_response.artifacts``
+        读取保存后的 ID。它服务于“删除这个/修改刚才那个”等指代；只接受服务端曾写入消息
+        上下文的产物，不从当前用户文本提取任意 ID。
+        """
         conditions = [
             Conversation.user_id == user_id,
             Message.role == MessageRole.ASSISTANT,
@@ -3707,8 +3938,15 @@ class AgentService:
         keyword: str,
         matched_from_context: bool = False,
     ) -> AgentChatResponse:
+        """逐项委托领域服务删除已确认候选，并汇总部分成功结果。
+
+        每项删除独立捕获异常，不存在覆盖所有资源类型的统一事务；因此响应同时保留成功项和
+        失败项。``user_id`` 会继续传给支持归属校验的领域服务，候选列表本身应已由当前用户
+        查询或会话上下文生成。
+        """
         deleted = []
         failures = []
+        # 逐项隔离错误，避免一个远程服务失败掩盖其他资源的真实删除结果。
         for item in matches:
             try:
                 delete_result = await self._delete_resource_by_type(resource_type, item["id"], user_id)
@@ -3750,6 +3988,12 @@ class AgentService:
         )
 
     async def _list_deletable_resources(self, resource_type: str, user_id: UUID, keyword: str = "") -> List[Dict[str, Any]]:
+        """从对应领域服务读取当前用户可删除资源，并统一为匹配字典。
+
+        JD、简历和面试服务显式接收 ``user_id``；试卷列表接口在此调用中没有用户参数，
+        因而该分支的隔离能力取决于 ``ExamService`` 自身的数据模型与上层权限设计。本方法
+        只列举候选，不执行删除。
+        """
         if resource_type == "jd":
             result = await JobDescriptionService(self.db).list_job_descriptions(user_id=user_id, page=1, size=100)
             return [
@@ -3824,6 +4068,12 @@ class AgentService:
         ]
 
     async def _delete_resource_by_type(self, resource_type: str, resource_id: str, user_id: UUID) -> Optional[Dict[str, Any]]:
+        """把统一删除动作分派到各领域服务，并保留各自的事务边界。
+
+        JD、简历和面试删除均携带当前用户；试卷删除签名只接收资源 ID，因此此处不能额外
+        注入用户条件。各领域服务可能操作本地数据库或远程 HR 服务，任一失败直接抛给批量
+        汇总层记录，不在本函数跨服务回滚。
+        """
         if resource_type == "jd":
             return await JobDescriptionService(self.db).delete_job_description(resource_id, user_id)
         if resource_type == "resume":
@@ -3875,12 +4125,20 @@ class AgentService:
             "exam": ["查看试卷列表", "重新生成试卷"],
         }.get(resource_type, ["查看列表", "换个名称再试"])
 
+    # ---------- 生成、持久化与响应解析辅助 ----------
+
     async def _parse_requirements(
         self,
         text: str,
         conversation_id: Optional[str],
         memory_context: str = "",
     ) -> Dict[str, Any]:
+        """把招聘描述和会话记忆解析为规范化 JD 字段。
+
+        输入原始文本、可选会话 ID 和已构建的记忆文本；当前实现不直接使用
+        ``conversation_id``，而是把记忆与字段约束交给 LLM，解析 JSON 后统一清洗。
+        返回结构化字典；模型异常或无有效 JSON 时使用本地规则解析，不产生持久化副作用。
+        """
         prompt = (
             "你是招聘助手。请从用户需求中提取结构化字段，并严格返回 JSON，不要解释。\n"
             "字段：job_title, department, location, salary, experience, education, job_type, skills, benefits, additional_requirements。\n"
@@ -3907,6 +4165,11 @@ class AgentService:
         conversation_id: Optional[str],
         memory_context: str = "",
     ) -> Dict[str, Any]:
+        """用确定性规则从当前消息和会话记忆提取试卷配置并补默认值。
+
+        与 JD 解析不同，当前实现不调用 LLM；``conversation_id`` 仅保留接口一致性。结果会
+        统一为题型、题量、时长、总分和知识文件列表，随后仍需用户确认或附件匹配。
+        """
         parsed = self._fallback_exam_parse("\n".join([memory_context, text]) if memory_context else text)
         return self._normalize_exam_requirements(parsed, original_text=text)
 
@@ -3916,6 +4179,13 @@ class AgentService:
         message: str,
         user_id: UUID,
     ) -> List[Dict[str, Any]]:
+        """根据试卷主题从当前用户知识库候选中选择一个参考文档。
+
+        ``KBSelectionService`` 先按用户读取候选，再校验模型选择的文档 ID；本函数只接受通过
+        该可信集合反查且置信度不低于阈值的结果。匹配失败属于可降级条件，返回空列表后由
+        对话层提示上传附件，而不是阻断请求。
+        """
+        # 将结构化主题和原始消息合成检索问题，避免只靠一个短标题匹配。
         query = " ".join(
             item for item in [
                 self._clean_optional_value(exam.get("subject")),
@@ -3947,6 +4217,11 @@ class AgentService:
         }]
 
     async def _generate_jd(self, original_text: str, parsed: Dict[str, Any], conversation_id: Optional[str]) -> str:
+        """把招聘字段转换为 Dify 工作流输入并同步生成 JD 正文。
+
+        ``conversation_id`` 当前不会传给远程工作流，避免复用外部会话状态；返回值只做通用
+        响应提取和去空白，不在此保存业务记录。
+        """
         query = self._build_jd_query(original_text, parsed)
         response = await self.dify_service.call_workflow_sync(
             workflow_type=1,
@@ -3967,6 +4242,12 @@ class AgentService:
         parsed: Dict[str, Any],
         conversation_id: Optional[str],
     ) -> AsyncGenerator[str, None]:
+        """流式生成 JD 文本并对重复增量去重。
+
+        输入原始需求和结构化字段，调用 Dify JD 工作流并逐段产出字符串。流式调用失败
+        或完全无内容时，才调用同步生成并按文本切片回退；若失败前已经得到部分内容，
+        保留已产出的部分而不再同步重跑。该函数只生成内容，不保存 JD。
+        """
         query = self._build_jd_query(original_text, parsed)
         full_text = ""
         try:
@@ -3990,6 +4271,7 @@ class AgentService:
         except Exception as exc:
             logger.warning("Agent JD 流式生成失败，回退同步生成: %s", exc)
 
+        # 仅在完全没有有效流式内容时同步回退，避免把已展示内容重复生成一遍。
         if not full_text.strip():
             fallback = await self._generate_jd(original_text, parsed, conversation_id)
             async for delta in self._stream_text(fallback):
@@ -4040,6 +4322,12 @@ class AgentService:
         jd_content: str,
         conversation_id: Optional[str],
     ) -> AsyncGenerator[str, None]:
+        """基于简历评价和 JD 流式生成面试计划文本。
+
+        输入评价记录、JD 内容和可选会话 ID，将简历、评分指标及候选信息传给 Dify，
+        去重后逐段产出。流式异常且尚无内容时回退同步生成；已有部分内容时不重跑。
+        本函数不创建面试计划记录，也不修改候选人状态。
+        """
         query = self._build_interview_plan_query()
         full_text = ""
         try:
@@ -4065,6 +4353,7 @@ class AgentService:
         except Exception as exc:
             logger.warning("Agent 面试计划流式生成失败，回退同步生成: %s", exc)
 
+        # 与 JD 流一致，仅对空结果执行同步回退。
         if not full_text.strip():
             fallback = await self._generate_interview_plan_content(resume, jd_content, conversation_id)
             async for delta in self._stream_text(fallback):
@@ -4074,6 +4363,11 @@ class AgentService:
         return "请根据候选人简历、JD要求和简历评分结果生成一份结构化面试计划。"
 
     async def _get_resume_evaluation(self, user_id: UUID, resume_evaluation_id: UUID) -> ResumeEvaluation:
+        """在同一 SQL 条件中校验评价记录存在性与用户归属。
+
+        未找到和不属于当前用户统一抛出同一错误，既为上层生成流程提供 ORM 实体，也避免
+        通过错误差异探测其他用户的资源 ID。
+        """
         result = await self.db.execute(
             select(ResumeEvaluation).where(
                 ResumeEvaluation.id == resume_evaluation_id,
@@ -4086,7 +4380,13 @@ class AgentService:
         return resume
 
     async def _save_exam_source_document(self, filename: str, content: bytes, user_id: UUID) -> Document:
+        """按用户和内容哈希复用或保存出题附件，并创建本地 Document 记录。
+
+        文件先写入用户目录，再提交 ORM 记录；数据库失败不会自动删除已落盘文件。命中当前
+        用户已有哈希时直接复用，不重复写文件。该方法只保存原文件，不提取文本或写向量。
+        """
         file_hash = hashlib.sha256(content).hexdigest()
+        # 查重条件同时包含 user_id，同一内容仍可由不同用户分别持有。
         existing_result = await self.db.execute(
             select(Document).where(
                 Document.file_hash == file_hash,
@@ -4145,6 +4445,11 @@ class AgentService:
         parsed: Dict[str, Any],
         conversation_id: Optional[str],
     ) -> str:
+        """把已生成 JD 交给 Dify 评分标准工作流并返回纯文本结果。
+
+        评分标准以 JD 正文为主要事实输入；该步骤不保存记录，也不与 JD 保存共享事务。
+        ``conversation_id`` 当前不传给远程调用。
+        """
         query = self._build_scoring_criteria_query(jd_content)
         response = await self.dify_service.call_workflow_sync(
             workflow_type=2,
@@ -4163,6 +4468,11 @@ class AgentService:
         parsed: Dict[str, Any],
         conversation_id: Optional[str],
     ) -> AsyncGenerator[str, None]:
+        """流式生成评分标准，并在完全无内容时调用同步版本降级。
+
+        流式块经过统一增量提取和重复裁剪；失败前已有文本会保留，避免前端已显示内容后又
+        重跑生成。此函数只产出字符串，不负责领域服务保存。
+        """
         query = self._build_scoring_criteria_query(jd_content)
         full_text = ""
         try:
@@ -4203,6 +4513,12 @@ class AgentService:
         user_id: UUID,
         conversation_id: Optional[str],
     ):
+        """组装 HR Agent 来源的 JD 创建数据并委托领域服务持久化。
+
+        输入生成内容、结构化需求、原始文本、用户和会话标识；返回领域服务构造的 JD
+        响应对象。副作用发生在 ``JobDescriptionService`` 的远程保存调用，本函数不直接
+        操作当前 SQLAlchemy 会话或 commit。
+        """
         jd_data = JobDescriptionCreate(
             title=parsed.get("job_title") or "未命名岗位",
             department=parsed.get("department"),
@@ -4235,6 +4551,12 @@ class AgentService:
         conversation_id: Optional[str],
         saved_jd_id: Optional[UUID] = None,
     ):
+        """组装评分标准创建数据并委托领域服务持久化。
+
+        输入评分内容、岗位字段、用户、会话及可选 JD 关联 ID；返回保存后的评分标准
+        响应对象。副作用由 ``ScoringCriteriaService`` 的远程保存调用完成，本函数不直接
+        操作当前 SQLAlchemy 会话或 commit。
+        """
         criteria_data = ScoringCriteriaCreate(
             title=f"{parsed.get('job_title') or '岗位'}简历评分标准",
             job_title=parsed.get("job_title"),

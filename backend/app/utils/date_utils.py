@@ -1,5 +1,9 @@
 """
-    日期和时间的工具函数
+日期时间的纯函数工具集。
+
+本模块不访问数据库，也不读取系统时区配置：未携带 ``tzinfo`` 的 datetime 在需要与带时区
+值运算或格式化时，会按现有约定视为 UTC。调用方应区分“给无时区值附加时区”和“把某一
+时刻转换到其他时区”；前者不会改变钟面时间，后者会保持同一绝对时刻。
 """
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -16,7 +20,11 @@ def format_datetime(
     format_string: str = "%Y-%m-%d %H:%M:%S",
     timezone_name: Optional[str] = None
 ) -> str:
-    """将datetime格式化为可选的时区转换字符串"""
+    """格式化时间，并可在输出前转换到指定时区。
+
+    无时区的 ``dt`` 在转换时按 UTC 解释；未知时区会静默退回原始值。该函数用于展示，
+    不应依靠格式化后的字符串继续进行时间计算。
+    """
     if not dt:
         return ""
     
@@ -38,7 +46,11 @@ def parse_datetime(
     format_string: str = "%Y-%m-%d %H:%M:%S",
     timezone_name: Optional[str] = None
 ) -> Optional[datetime]:
-    """解析带有可选时区的datetime字符串"""
+    """按给定格式解析字符串，并返回带时区的 datetime 或 ``None``。
+
+    字符串格式错误直接返回 ``None``；指定时区无效时会按 UTC 附加时区。这里的“附加”
+    不进行钟面时间换算，调用方需确认输入字符串原本代表哪个时区。
+    """
     if not date_string:
         return None
     
@@ -69,7 +81,11 @@ def get_timezone(timezone_name: str) -> Optional[timezone]:
 
 
 def days_between(start_date: datetime, end_date: datetime) -> int:
-    """计算两个日期之间的天数"""
+    """计算结束时间减开始时间后的完整天数。
+
+    仅当一侧缺少时区时，才按现有约定把该侧视为 UTC；两侧均为无时区值时直接相减。
+    ``timedelta.days`` 会向下取整，不表示跨越了多少个自然日期。
+    """
     if not start_date or not end_date:
         return 0
     
@@ -84,7 +100,7 @@ def days_between(start_date: datetime, end_date: datetime) -> int:
 
 
 def hours_between(start_time: datetime, end_time: datetime) -> float:
-    """计算两个日期时间之间的小时数"""
+    """计算结束时间减开始时间后的小时数，时区补齐约定与 ``days_between`` 相同。"""
     if not start_time or not end_time:
         return 0.0
     
@@ -246,7 +262,7 @@ def get_relative_time(dt: datetime, reference_time: Optional[datetime] = None) -
 
 
 def convert_timezone(dt: datetime, from_tz: str, to_tz: str) -> Optional[datetime]:
-    """将datetime从一个时区转换为另一个时区"""
+    """把时间从来源时区转换到目标时区；无时区输入先按 ``from_tz`` 本地化。"""
     try:
         from_timezone = pytz.timezone(from_tz)
         to_timezone = pytz.timezone(to_tz)

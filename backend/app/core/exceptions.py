@@ -1,5 +1,9 @@
 """
-自定义异常类
+项目统一的业务异常类型。
+
+所有异常最终继承 ``BaseHTTPException``，由类本身携带状态码、用户可读消息和可选详情；
+具体领域异常只负责选择语义正确的默认值。全局异常处理器据此生成一致的 JSON 响应，
+业务服务不需要重复拼装 ``JSONResponse``。
 """
 from typing import Any, Dict, Optional
 

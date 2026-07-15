@@ -1,3 +1,11 @@
+"""
+开发环境的内置角色与测试管理员种子脚本。
+
+脚本直接创建异步数据库会话：先按角色名称补齐内置角色，再按用户名补齐测试用户，最后补
+齐用户—角色关联。每一步都先查询后插入，重复运行通常不会制造重复数据；但三个阶段分别
+提交，并不是一个原子事务。脚本包含固定测试凭据，不应用于生产环境。
+"""
+
 import asyncio
 from sqlalchemy import select
 import sys
@@ -14,6 +22,11 @@ from app.core.security import get_password_hash
 
 
 async def seed_roles_and_admin():
+    """幂等补齐角色、测试管理员及其多角色关联。
+
+    ``User.role`` 旧枚举和 ``user_role`` 多角色关联都会写入，使依赖任一权限模型的现有
+    调用链都能识别该测试管理员。阶段性 ``commit`` 让后续查询可见前一步生成的主键。
+    """
     await init_db()
 
     async with AsyncSessionLocal() as db:
@@ -57,6 +70,7 @@ async def seed_roles_and_admin():
 
 
 def main():
+    """在独立事件循环中执行异步种子流程。"""
     asyncio.run(seed_roles_and_admin())
 
 

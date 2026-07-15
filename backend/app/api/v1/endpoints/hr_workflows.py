@@ -1,6 +1,9 @@
 """
-Dify工作流API端点
-通过Dify工作流处理各种HR自动化任务，支持工作流类型1-6
+传统 HR AI 工作流 API 聚合模块。
+
+本模块按 Dify 工作流类型编排需求解析、JD 生成、评分标准、简历评价、面试方案和试卷任务。
+自然语言解析优先采用大模型结果，JSON 无法解析时使用本地规则兜底；生成类任务根据请求
+选择同步返回或 ``StreamingResponse``。已模块化的新入口位于 ``agent`` 端点。
 """
 from typing import Any, Optional, Dict, List
 from uuid import UUID
@@ -167,9 +170,10 @@ async def generate_job_description(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    生成岗位JD (Job Description)
-    工作流类型: type=1
+    """把 JD 生成请求组装为 Dify type=1 输入，并按请求选择同步或 SSE 风格响应。
+
+    可选岗位、部门和经验字段同时进入提示词与 ``inputs``；流式路径逐块包装 ``data`` 并以
+    ``[DONE]`` 结束，非流式路径直接返回远程 JSON。本端点不保存生成的 JD。
     """
     try:
         dify_service = DifyService()
@@ -236,10 +240,10 @@ async def generate_scoring_criteria(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    生成简历评分标准
-    基于JD内容生成对应的简历评分标准
-    工作流类型: type=2
+    """基于 JD 内容构造 Dify type=2 评分标准请求，并选择同步或流式返回。
+
+    结构化需求会同时拼入提示词并序列化到远程 ``inputs``；流式路径只转发生成内容，非流式
+    返回完整远程 JSON。本端点不负责把生成结果持久化。
     """
     try:
         dify_service = DifyService()
@@ -323,9 +327,10 @@ async def evaluate_resume(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    上传简历并进行AI评价
-    工作流类型: type=3
+    """读取上传简历并按指定 JD 执行 type=3 评价与持久化。
+
+    JD、可选会话 ID 先转换为 UUID，空文件在调用服务前拒绝；服务层继续校验格式、读取远程
+    JD/评分标准、调用 Dify、保存原文件和评价记录，最终结果再经响应 Schema 校验。
     """
     try:
         # 验证参数格式
@@ -365,9 +370,10 @@ async def generate_interview_plan_by_resume(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    根据简历ID生成面试方案
-    工作流类型: type=4
+    """根据当前用户拥有的简历评价调用 Dify type=4 生成面试方案文本。
+
+    评价 ID 与用户 ID 在同一 SQL 中过滤，再以认证用户上下文读取关联远程 JD；简历正文和
+    JD 内容作为工作流输入。同步/流式分支都只返回生成内容，本端点不保存面试方案。
     """
     try:
         # 查询简历评价记录
@@ -684,9 +690,10 @@ async def generate_exam(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    基于文档内容生成试卷
-    type=5
+    """把结构化试卷配置交给 ``ExamService`` 生成 type=5 试卷。
+
+    认证用户 ID 与知识文件、题型、题量等配置一并进入服务；流式分支返回服务生成器，非流式
+    分支等待完整结果。文档读取、模型调用和是否保存由服务层编排。
     """
     try:
         from app.services.exam_service import ExamService
@@ -749,9 +756,10 @@ async def submit_exam(
     request: ExamSubmitRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    提交考试答案并调用Dify进行自动评分
-    type=6
+    """提交匿名考生答案并由 ``ExamService`` 调用 type=6 自动评分。
+
+    该端点不注入登录用户，试卷 ID、考生信息、答案和客户端携带的试卷内容直接进入服务层；
+    试卷公开可答范围、评分和结果持久化均由服务实现决定。
     """
     try:
         from app.services.exam_service import ExamService

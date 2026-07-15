@@ -1,5 +1,9 @@
 """
-使用DashScope API的Qwen模型进行重排服务
+向量检索结果的二阶段重排服务。
+
+RAG 先用向量相似度取得候选文档，本服务再调用 Qwen ``TextReRank`` 按问题相关性重新
+打分和排序。同步 SDK 调用放在线程池中；功能关闭、依赖/密钥缺失或远程调用失败时，
+保留原始顺序作为降级结果，不中断问答流程。
 """
 import logging
 from typing import List, Dict, Any, Optional, Tuple
@@ -23,7 +27,7 @@ except ImportError:
 
 
 class RerankService:
-    """使用Qwen模型提高检索结果质量的重排服务"""
+    """在向量候选集上执行可降级的 Qwen 二阶段相关性排序。"""
 
     def __init__(self):
         self.model = None
@@ -31,7 +35,11 @@ class RerankService:
         self._initialize_model()
 
     def _initialize_model(self):
-        """根据配置初始化重排模型"""
+        """根据功能开关、SDK 可用性和密钥决定是否启用远程重排。
+
+        初始化只设置 DashScope 全局密钥和本地可用标记，不加载本地模型；任一前置条件不满足
+        都保持 ``self.model=None``，后续调用将走保序降级。
+        """
         if not settings.RERANK_ENABLED:
             logger.info("配置中已禁用重排")
             return
@@ -50,7 +58,11 @@ class RerankService:
         logger.info("Qwen重排模型初始化成功")
 
     def _compute_rerank_scores(self, query: str, documents: List[str]) -> List[float]:
-        """使用Qwen模型计算文档的重排分数"""
+        """为候选正文返回与输入顺序一一对应的分数列表。
+
+        模型不可用时生成递减的占位分数，因此排序保持原始候选顺序；可用时才调用 Qwen。
+        该降级分数不代表真实相关性，只用于维持统一排序接口。
+        """
         if not self.model:
             # 如果模型不可用，返回原始顺序分数
             return [1.0 - i * 0.1 for i in range(len(documents))]
@@ -59,7 +71,11 @@ class RerankService:
         return self._compute_qwen_rerank_scores(query, documents)
 
     def _compute_qwen_rerank_scores(self, query: str, documents: List[str]) -> List[float]:
-        """通过DashScope API使用Qwen模型计算重排分数"""
+        """调用同步 ``TextReRank``，并把供应商结果映射回原候选索引。
+
+        供应商返回结果可能按相关性排序，因此不能直接使用其列表顺序；这里根据 ``index``
+        写回等长分数数组。依赖/密钥缺失、非 200 或调用异常均返回保持原顺序的递减分数。
+        """
         if not DASHSCOPE_AVAILABLE or not settings.QWEN_API_KEY:
             logger.error("DashScope不可用或QWEN_API_KEY未设置")
             return [1.0 - i * 0.1 for i in range(len(documents))]
@@ -102,17 +118,11 @@ class RerankService:
         sources: List[Dict[str, Any]],
         top_k: Optional[int] = None
     ) -> Tuple[List[LangChainDocument], List[Dict[str, Any]]]:
-        """
-        使用Qwen模型根据查询相关性对文档进行重排
+        """同步重排文档与来源元数据，并截取最终 top_k。
 
-        Args:
-            query: 搜索查询
-            documents: LangChain文档列表
-            sources: 源元数据列表
-            top_k: 要返回的顶级结果数（默认为RERANK_FINAL_K）
-
-        Returns:
-            (重排文档, 重排源)的元组
+        ``documents`` 与 ``sources`` 必须按索引对应。只取前 ``RERANK_TOP_K`` 个向量候选送给
+        远程模型，同步 SDK 在线程池运行；得分写入来源字典副本后降序排序。禁用、不可用时
+        原样返回，异常时按 ``top_k`` 截取原始顺序，RAG 主流程仍可继续。
         """
         if not settings.RERANK_ENABLED or not self.model or not documents:
             return documents, sources
@@ -173,16 +183,16 @@ class RerankService:
             return documents[:top_k], sources[:top_k]
 
     def is_enabled(self) -> bool:
-        """检查重排是否启用且模型可用"""
+        """同时检查配置开关与初始化标记，不发起远程探活请求。"""
         return settings.RERANK_ENABLED and self.model is not None
 
 
-# 全局重排服务实例
+# 首次使用时才创建线程池和重排服务，后续调用复用同一进程内实例。
 _rerank_service = None
 
 
 def get_rerank_service() -> RerankService:
-    """获取全局重排服务实例"""
+    """惰性创建进程内重排服务；多 worker 部署时每个进程各有一个实例。"""
     global _rerank_service
     if _rerank_service is None:
         _rerank_service = RerankService()

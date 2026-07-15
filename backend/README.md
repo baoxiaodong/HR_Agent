@@ -127,7 +127,7 @@ cp .env.example .env
 
 ### 初始化数据库
 ```bash
-python backend/scripts/seed_roles.py
+python scripts/seed_roles.py
 ```
 会创建一个超级管理员账号testuser/test123
 
@@ -141,7 +141,7 @@ python main.py
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 # 生产模式
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 访问 `http://localhost:8000/api/v1/docs` 查看 API 文档。
@@ -194,7 +194,7 @@ API 使用 OpenAPI/Swagger 文档自动生成。启动服务后访问:
 
 ### 代码结构
 
-- `app/main.py` - 应用入口点
+- `main.py` - 应用入口点
 - `app/core/` - 核心配置和中间件
 - `app/models/` - 数据库模型定义
 - `app/schemas/` - Pydantic 数据验证模型

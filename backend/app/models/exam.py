@@ -1,5 +1,9 @@
 """
-    试卷和试题相关的数据库模型
+试卷与结构化题目的数据库模型。
+
+``Exam`` 保存生成配置和模型返回的原始试卷文本，``Question`` 保存解析后的题型、选项、
+答案和分值。二者是一对多关系；删除试卷会级联删除题目，服务层可分别使用原始文本和
+结构化题目满足展示、编辑和评分场景。
 """
 from sqlalchemy import Column, String, Integer, Text, JSON, ForeignKey, Float
 from sqlalchemy.dialects.postgresql import UUID

@@ -1,5 +1,7 @@
 """
-v1端点的主API路由
+API v1 路由聚合入口。
+
+本模块只按既定顺序挂载各领域路由并统一暴露健康检查，不承载具体业务逻辑。
 """
 from fastapi import APIRouter
 
@@ -7,20 +9,26 @@ from app.api.v1.endpoints import auth, users, conversations, documents, knowledg
 
 api_router = APIRouter()
 
-# 包含所有端点路由
+# ---------- 认证与用户 ----------
 api_router.include_router(auth.router, prefix="/auth", tags=["authentication"])
 api_router.include_router(users.router, prefix="/users", tags=["users"])
+
+# ---------- 对话、文档与知识能力 ----------
 api_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
 api_router.include_router(documents.router, prefix="/documents", tags=["documents"])
 api_router.include_router(knowledge_base.router, prefix="/knowledge-base", tags=["knowledge-base"])
 api_router.include_router(chat.router, prefix="/chat", tags=["chat"])
 api_router.include_router(knowledge_assistant.router, prefix="/knowledge-assistant", tags=["knowledge-assistant"])
+
+# ---------- 核心 HR 业务 ----------
 api_router.include_router(stats.router, prefix="/stats", tags=["stats"])
 api_router.include_router(hr_workflows.router, prefix="/hr-workflows", tags=["hr-workflows"])
 api_router.include_router(job_description.router, prefix="/job-descriptions", tags=["job-descriptions"])
 api_router.include_router(scoring_criteria.router, prefix="/scoring-criteria", tags=["scoring-criteria"])
 api_router.include_router(resume_evaluation.router, prefix="/resume-evaluation", tags=["resume-evaluation"])
 api_router.include_router(interview_plan.router, prefix="/interview-plans", tags=["interview-plans"])
+
+# ---------- 管理能力与智能入口 ----------
 api_router.include_router(email_configs.router, prefix="/email-configs", tags=["email-configs"])
 api_router.include_router(exam_management.router, prefix="/exam-management", tags=["exam-management"])
 api_router.include_router(intent_router.router, prefix="/intent", tags=["intent"])

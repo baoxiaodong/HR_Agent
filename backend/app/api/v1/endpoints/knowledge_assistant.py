@@ -1,5 +1,9 @@
 """
-知识助手端点，用于文档处理和问答
+知识助手（RAG 问答）API。
+
+提问请求先验证会话归属，再由 ``KnowledgeAssistantService`` 检索知识库并流式生成答案；
+生成器把开始、文本片段、结束或错误事件编码为 SSE，完整生成后再把用户问题和助手答案
+写入会话。知识库自动选择由独立的 ``KBSelectionService`` 完成，避免端点内混入排序逻辑。
 """
 from typing import Any, List, Dict
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
@@ -26,8 +30,9 @@ router = APIRouter()
 async def get_knowledge_assistant_config(
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    获取知识助手配置
+    """返回知识助手允许前端使用的公开运行限制。
+
+    当前仅读取进程配置中的上下文条数，不需要登录，也不访问用户数据或暴露模型凭据。
     """
     service = KnowledgeAssistantService(db)
     return await service.get_config()
@@ -42,8 +47,10 @@ async def ask_knowledge_assistant(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    使用RAG工作流向知识助手提问，返回流式响应
+    """校验会话归属后执行 RAG 问答，并把内部事件编码为 SSE。
+
+    历史 JSON 解析失败会降级为空列表；会话 ID 必须合法且属于当前用户。生成期间累计助手文本
+    与来源，流正常结束后分别保存用户和助手消息；响应开始后的错误只能作为 error 事件输出。
     """
     service = KnowledgeAssistantService(db)
     conv_service = ConversationService(db)
@@ -144,8 +151,10 @@ async def get_knowledge_documents(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    获取知识库中的文档列表（性能优化版本）
+    """分页返回当前用户文档，可选限制到指定知识库。
+
+    用户 ID 是固定查询边界；知识库 ID 在服务层转为 UUID，非法值原本会形成 400，但当前端点
+    的通用异常包装可能把它转换为 500。返回 ``total`` 是本页数量而非数据库总数。
     """
     service = KnowledgeAssistantService(db)
     
@@ -171,8 +180,10 @@ async def auto_select_kb(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    通过对文档进行 LLM 排序自动选择知识库并返回知识库 ID。
+    """从当前用户的有限候选文档中选择最相关知识库。
+
+    LLM 只推荐文档 ID，服务层会回到用户范围内候选集合验证并映射知识库 ID；无候选、无效
+    模型输出或未命中时返回字段稳定的空选择，而不是任意猜测资源。
     """
     try:
         kb_selector = KBSelectionService(db)

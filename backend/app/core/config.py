@@ -1,5 +1,9 @@
-﻿"""
-    应用程序配置设置
+"""
+应用配置的统一入口。
+
+``Settings`` 继承 Pydantic ``BaseSettings``：类属性提供默认值，启动时再由 ``.env``
+中的同名变量覆盖并完成类型转换。模块末尾只创建一个 ``settings`` 单例，其他模块均从
+这里读取配置，避免各业务模块自行解析环境变量。
 """
 from pathlib import Path
 from typing import List, Optional
@@ -38,12 +42,12 @@ class Settings(BaseSettings):
         raise ValueError(v)
 
     # 数据库设置
-    DATABASE_URL: str = "postgresql://hr_agent_user:password@101.42.116.88:5433/hr_agent"
-    DATABASE_HOST: str = "101.42.116.88"
-    DATABASE_PORT: int = 5433
+    DATABASE_URL: str = "postgresql://postgres:change-me@localhost:5432/hr_agent"
+    DATABASE_HOST: str = "localhost"
+    DATABASE_PORT: int = 5432
     DATABASE_NAME: str = "hr_agent"
-    DATABASE_USER: str = "hr_agent_user"
-    DATABASE_PASSWORD: str = "password"
+    DATABASE_USER: str = "postgres"
+    DATABASE_PASSWORD: str = "change-me"
     DATABASE_POOL_SIZE: int = 10
     DATABASE_MAX_OVERFLOW: int = 20
 

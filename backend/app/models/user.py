@@ -1,5 +1,9 @@
 """
-用于身份验证和用户管理的用户模型
+用户、角色及多对多关联的数据库模型。
+
+``User.role`` 是单值的旧角色枚举，``User.roles`` 则通过 ``user_role`` 关联表支持动态多角色；
+认证依赖会按不同场景读取其中一种。用户删除时级联清理其会话和文档，角色关联通过联合
+唯一约束防止同一角色重复分配。
 """
 from sqlalchemy import Column, String, Boolean, DateTime, Text, Enum, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
@@ -52,6 +56,8 @@ class User(BaseModel):
         return f"<User(username='{self.username}', email='{self.email}')>"
 
 class Role(BaseModel):
+    """可由数据库动态维护的角色；与 ``User.role`` 旧枚举并行存在。"""
+
     __tablename__ = "role"
 
     name = Column(String(50), unique=True, nullable=False, index=True)
@@ -62,6 +68,8 @@ class Role(BaseModel):
 
 
 class UserRoleAssociation(BaseModel):
+    """用户与动态角色的关联表；联合唯一约束阻止重复分配同一角色。"""
+
     __tablename__ = "user_role"
 
     user_id = Column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)

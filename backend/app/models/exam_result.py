@@ -1,5 +1,9 @@
 """
-考试结果相关的数据库模型
+考生答卷与评分结果的数据库模型。
+
+每条 ``ExamResult`` 保存试卷标识、考生信息和总分摘要，同时把试卷、答案及逐题评分整体
+保存在 ``exam_data`` JSON 中，便于完整回放。``exam_id`` 当前只是 UUID 字段，不声明
+数据库外键关系。
 """
 from sqlalchemy import Column, String, Integer, Text, JSON, ForeignKey, Float, DateTime
 from sqlalchemy.dialects.postgresql import UUID

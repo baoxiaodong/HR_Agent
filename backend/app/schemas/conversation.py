@@ -1,5 +1,9 @@
 """
-对话相关的Schema
+对话和消息 API 的输入输出 Schema。
+
+Base/Create/Update/InDB 分层用于复用字段：Create 接收创建数据，Update 只声明可修改字段，
+InDB 增加主键、归属和时间，最外层公开模型用于响应。端点会把 ORM 的
+``total_messages`` 映射为 Schema 中的 ``message_count``。
 """
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -10,7 +14,7 @@ from app.models.conversation import MessageRole, ConversationStatus
 
 
 class ConversationBase(BaseModel):
-    """基础对话模式"""
+    """创建请求和公开响应共同拥有的会话描述字段。"""
     title: str = Field(..., min_length=1, max_length=200, description="对话标题")
     description: Optional[str] = Field(None, max_length=500, description="对话描述")
     meta_data: Optional[Dict[str, Any]] = Field(None, description="元数据")
@@ -48,11 +52,14 @@ class Conversation(ConversationInDB):
 
 
 class MessageBase(BaseModel):
-    """基础消息模式"""
+    """用户消息和助手消息共同拥有的内容、角色及模型上下文字段。"""
     model_config = {"protected_namespaces": ()}
-    
+
+    # content 是展示正文；role 决定它在提交给大模型时属于哪一方。
     content: str = Field(..., min_length=1, description="消息内容")
     role: MessageRole = Field(..., description="消息角色")
+
+    # 助手消息可记录生成模型和检索上下文，用户消息通常为空。
     model_name: Optional[str] = Field(None, description="模型名称")
     context: Optional[Dict[str, Any]] = Field(None, description="上下文信息")
 

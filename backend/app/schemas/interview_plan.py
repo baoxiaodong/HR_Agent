@@ -1,5 +1,9 @@
 """
-    访问API请求/响应验证的计划Schema
+面试方案生成、保存与分页响应 Schema。
+
+生成请求引用当前用户可见的简历评价；服务层据此组织 LLM 输入，生成的自由文本再通过保存
+请求写入远程 HR 服务。Schema 负责 UUID、必填字段和响应形状校验，不负责证明简历评价或
+返回方案归属于当前认证用户。
 """
 from typing import Optional, Dict, Any, List
 from datetime import datetime

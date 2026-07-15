@@ -1,5 +1,10 @@
 """
-    HR Agent 的 skill技能模块
+HR Agent 的 Skill 加载与调度组件。
+
+每个 Skill 目录使用 ``SKILL.md`` 提供说明和基础元数据，使用 ``skill.json``
+manifest 声明意图、阶段及阶段脚本映射。阶段脚本由 ``ScriptedSkillPhase``
+动态加载，``AgentSkillBundle`` 组织同一 Skill 的阶段并解析当前阶段，dispatcher
+按意图定位 bundle，也可用确认动作反查对应 bundle。
 """
 from __future__ import annotations
 
@@ -52,25 +57,32 @@ class ScriptedSkillPhase:
             return ""
 
     async def run(self, context: dict[str, Any]) -> dict[str, Any]:
+        # 模块名只用于本次动态加载标识；真正执行文件由 manifest 中解析出的 script_path 决定。
         module_name = f"skill_{self.skill_dir.name}_{self.definition.phase_name}".replace("-", "_")
         spec = importlib.util.spec_from_file_location(module_name, self.definition.script_path)
         if spec is None or spec.loader is None:
             raise RuntimeError(f"无法加载 skill 脚本: {self.definition.script_path}")
+
+        # 加载阶段会执行脚本模块顶层代码，因此 Skill 目录属于受信任的本地扩展边界，而非普通数据文件。
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         fn = getattr(module, self.definition.function_name, None)
         if fn is None:
             raise RuntimeError(f"skill 脚本缺少函数 {self.definition.function_name}: {self.definition.script_path}")
 
+        # 运行上下文在原调用参数基础上附加 Skill 路径、说明文本和当前阶段，供脚本统一读取。
         enriched_context = {
             **context,
             "skill_dir": self.skill_dir,
             "skill_markdown": self.load_skill_instructions(),
             "phase_name": self.definition.phase_name,
         }
+
+        # 阶段函数可以同步返回字典，也可以返回 awaitable；调度器在这里统一成异步结果。
         result = fn(enriched_context)
         if inspect.isawaitable(result):
             result = await result
+        # dict 是 Agent 编排层约定的唯一阶段输出形状，防止任意对象继续向响应层传播。
         if not isinstance(result, dict):
             raise RuntimeError(f"skill phase 必须返回 dict: {self.definition.script_path}#{self.definition.function_name}")
         return result
@@ -90,6 +102,8 @@ class AgentSkillBundle:
         return self.phases[phase]
 
     def resolve_phase(self, confirmed_requirements: Optional[dict[str, Any]] = None) -> str:
+        # 只有 manifest 声明的确认动作精确匹配且存在 send 阶段时才切换；
+        # 其余请求统一回到默认阶段，避免把普通确认误当成发送动作。
         action = str((confirmed_requirements or {}).get("action") or "").strip()
         if self.metadata.confirmation_action and action == self.metadata.confirmation_action and "send" in self.phases:
             return "send"
@@ -108,9 +122,11 @@ class AgentSkillDispatcher:
         return self.bundles[intent]
 
     def dispatch(self, intent: str, phase: str) -> ScriptedSkillPhase:
+        """按意图和阶段返回已注册的脚本阶段；任一键不存在时抛出 ``KeyError``。"""
         return self.get_bundle(intent).get_phase(phase)
 
     def match_confirmation_action(self, action: str) -> Optional[AgentSkillBundle]:
+        # 确认动作按 manifest 中的字符串精确匹配，命中后由 bundle 决定实际阶段。
         for bundle in self.bundles.values():
             if bundle.metadata.confirmation_action == action:
                 return bundle
@@ -118,6 +134,7 @@ class AgentSkillDispatcher:
 
 
 def parse_skill_metadata(skill_markdown_path: Path) -> Optional[dict[str, str]]:
+    """读取 ``SKILL.md`` 的简易 frontmatter；文件缺失或格式无效时返回 ``None``。"""
     try:
         content = skill_markdown_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -146,6 +163,10 @@ def parse_skill_metadata(skill_markdown_path: Path) -> Optional[dict[str, str]]:
 
 
 def parse_skill_manifest(skill_dir: Path) -> Optional[SkillMetadata]:
+    """解析 ``skill.json`` 基础字段并补充说明。
+
+    不验证 ``default_phase`` 是否属于 ``phases``，也不验证阶段脚本声明是否完整。
+    """
     manifest_path = skill_dir / "skill.json"
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -183,11 +204,13 @@ def parse_skill_manifest(skill_dir: Path) -> Optional[SkillMetadata]:
 
 
 def build_skill_bundle_from_directory(skill_dir: Path) -> Optional[AgentSkillBundle]:
+    """从 Skill 目录构建阶段集合；跳过无脚本映射的阶段，无可用阶段时返回 ``None``。"""
     metadata = parse_skill_manifest(skill_dir)
     if not metadata:
         return None
 
     phases: dict[str, ScriptedSkillPhase] = {}
+    # manifest 先给出阶段顺序；缺少或无法解析映射的阶段会被跳过，不阻断其他阶段。
     for phase in metadata.phases:
         phase_spec = parse_phase_script_spec(skill_dir, phase)
         if not phase_spec:
@@ -207,6 +230,10 @@ def build_skill_bundle_from_directory(skill_dir: Path) -> Optional[AgentSkillBun
 
 
 def parse_phase_script_spec(skill_dir: Path, phase: str) -> Optional[SkillPhaseDefinition]:
+    """解析指定阶段的 ``相对脚本路径:函数名`` 映射。
+
+    只检查映射非空且包含冒号，不完整验证脚本路径、函数名或阶段一致性。
+    """
     manifest_path = skill_dir / "skill.json"
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -220,6 +247,7 @@ def parse_phase_script_spec(skill_dir: Path, phase: str) -> Optional[SkillPhaseD
     if not raw or ":" not in raw:
         return None
     rel_path, function_name = raw.split(":", 1)
+    # 当前只做路径拼接，没有 resolve 后验证脚本仍位于 skill_dir 内；manifest 被视为受信任本地配置。
     return SkillPhaseDefinition(
         phase_name=phase,
         script_path=skill_dir / rel_path.strip(),
@@ -228,7 +256,7 @@ def parse_phase_script_spec(skill_dir: Path, phase: str) -> Optional[SkillPhaseD
 
 
 def build_default_skill_dispatcher(skills_root: Optional[Path] = None) -> AgentSkillDispatcher:
-    """自动扫描 skills 目录，构建当前仓库默认的 skill 调度器。"""
+    """扫描根目录的直接子目录构建 dispatcher；目录不存在时返回空调度器。"""
     root = Path(skills_root) if skills_root else Path(__file__).resolve().parents[2] / "skills"
     bundles: dict[str, AgentSkillBundle] = {}
     if not root.exists():
@@ -238,5 +266,6 @@ def build_default_skill_dispatcher(skills_root: Optional[Path] = None) -> AgentS
         bundle = build_skill_bundle_from_directory(skill_dir)
         if not bundle:
             continue
+        # dispatcher 以 intent 为唯一键；多个目录声明同一 intent 时，按目录排序靠后的 bundle 覆盖前者。
         bundles[bundle.intent] = bundle
     return AgentSkillDispatcher(bundles)

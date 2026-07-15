@@ -1,5 +1,9 @@
 """
-  验证相关的工具函数
+进入业务服务前可复用的格式校验与字符串净化工具。
+
+这些函数只返回布尔值、错误列表或净化后的字符串，不查询数据库，也不实施权限检查。
+正则校验只能作为输入质量检查：SQL 安全仍依赖参数化查询，HTML 安全应依赖与具体渲染
+场景匹配的净化/转义策略，文件安全还需要业务层约束保存根目录和真实文件内容。
 """
 import re
 from typing import List, Optional
@@ -7,7 +11,7 @@ from pathlib import Path
 
 
 def validate_email(email: str) -> bool:
-    """Validate email address format"""
+    """用轻量正则检查邮箱地址外形，不验证域名或邮箱是否真实存在。"""
     if not email:
         return False
     
@@ -16,11 +20,10 @@ def validate_email(email: str) -> bool:
 
 
 def validate_password(password: str) -> tuple[bool, List[str]]:
-    """
-    Validate password strength
+    """按当前密码策略返回 ``(是否通过, 全部错误)``。
 
-    Returns:
-        tuple: (is_valid, list_of_errors)
+    该函数检查长度、字符种类和少量常见弱密码，不负责哈希、泄露密码库比对或登录限流；
+    通过校验的明文仍必须交给安全模块哈希后才能持久化。
     """
     errors = []
 
@@ -59,12 +62,7 @@ def validate_password(password: str) -> tuple[bool, List[str]]:
 
 
 def validate_username(username: str) -> tuple[bool, List[str]]:
-    """
-    Validate username format
-    
-    Returns:
-        tuple: (is_valid, list_of_errors)
-    """
+    """按长度、允许字符和保留字规则返回用户名校验结果及全部错误。"""
     errors = []
     
     if not username:
@@ -100,7 +98,7 @@ def validate_username(username: str) -> tuple[bool, List[str]]:
 
 
 def validate_file_type(filename: str, allowed_types: List[str]) -> bool:
-    """Validate file type based on extension"""
+    """按扩展名检查文件类型，不读取或验证文件真实内容。"""
     if not filename or not allowed_types:
         return False
     
@@ -109,12 +107,16 @@ def validate_file_type(filename: str, allowed_types: List[str]) -> bool:
 
 
 def validate_file_size(file_size: int, max_size: int) -> bool:
-    """Validate file size"""
+    """检查文件字节数处于 ``(0, max_size]`` 范围。"""
     return 0 < file_size <= max_size
 
 
 def sanitize_filename(filename: str) -> str:
-    """Sanitize filename for safe storage"""
+    """去掉目录部分、控制字符和常见非法字符，得到单个文件名。
+
+    结果只适合作为保存路径的一个组成部分；调用方仍需在可信根目录下拼接并校验最终路径，
+    同时处理同名文件和扩展名伪装。
+    """
     if not filename:
         return "unnamed_file"
     
@@ -146,7 +148,7 @@ def sanitize_filename(filename: str) -> str:
 
 
 def validate_phone_number(phone: str) -> bool:
-    """Validate phone number format (simple validation)"""
+    """去掉非数字字符后，按 10 到 15 位长度做宽松校验。"""
     if not phone:
         return False
     
@@ -158,7 +160,7 @@ def validate_phone_number(phone: str) -> bool:
 
 
 def validate_url(url: str) -> bool:
-    """Validate URL format"""
+    """按当前正则检查 HTTP(S) URL 外形，不发起网络连接或判断目标可信性。"""
     if not url:
         return False
     
@@ -167,7 +169,7 @@ def validate_url(url: str) -> bool:
 
 
 def validate_date_string(date_string: str, format_pattern: str = r'^\d{4}-\d{2}-\d{2}$') -> bool:
-    """Validate date string format (YYYY-MM-DD by default)"""
+    """检查日期字符串外形；默认不验证月份和日期是否真实存在。"""
     if not date_string:
         return False
     
@@ -175,7 +177,7 @@ def validate_date_string(date_string: str, format_pattern: str = r'^\d{4}-\d{2}-
 
 
 def validate_uuid(uuid_string: str) -> bool:
-    """Validate UUID format"""
+    """检查标准连字符 UUID 文本及其版本、variant 位。"""
     if not uuid_string:
         return False
     
@@ -184,7 +186,7 @@ def validate_uuid(uuid_string: str) -> bool:
 
 
 def validate_json_string(json_string: str) -> bool:
-    """Validate JSON string format"""
+    """确认字符串可被标准库解析为任意合法 JSON 值。"""
     if not json_string:
         return False
     
@@ -197,7 +199,7 @@ def validate_json_string(json_string: str) -> bool:
 
 
 def validate_ip_address(ip: str) -> bool:
-    """Validate IP address format (IPv4)"""
+    """按四个十进制分段检查 IPv4 文本。"""
     if not ip:
         return False
     
@@ -206,7 +208,7 @@ def validate_ip_address(ip: str) -> bool:
 
 
 def validate_hex_color(color: str) -> bool:
-    """Validate hex color format"""
+    """检查三位或六位十六进制颜色文本。"""
     if not color:
         return False
     
@@ -215,7 +217,11 @@ def validate_hex_color(color: str) -> bool:
 
 
 def sanitize_html_input(text: str) -> str:
-    """Sanitize HTML input to prevent XSS"""
+    """转义 HTML 字符，并移除少量已知危险协议/事件字符串。
+
+    ``html.escape`` 已把标签转换成文本，后续正则仅是附加过滤。此函数适合纯文本展示；若
+    产品需要保留部分 HTML，应改用带允许列表的专业净化器，而不是依赖这里的模式集合。
+    """
     if not text:
         return ""
     
@@ -249,7 +255,11 @@ def sanitize_html_input(text: str) -> str:
 
 
 def validate_sql_input(text: str) -> bool:
-    """Check for potential SQL injection patterns"""
+    """拒绝少量常见 SQL 注入外形，仅作为提示性预检。
+
+    正则黑名单既可能误伤正常文本，也无法覆盖编码、注释和数据库方言变体；数据库访问必须
+    始终使用绑定参数，不能因本函数返回 ``True`` 就拼接 SQL。
+    """
     if not text:
         return True
     

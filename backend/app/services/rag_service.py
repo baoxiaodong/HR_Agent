@@ -1,5 +1,8 @@
 """
-使用LangChain的RAG（检索增强生成）服务
+基于 LangChain 的检索增强问答服务。
+
+负责查询增强、向量与全文混合检索、结果融合和可选重排，并构造普通对话或 RAG 流式回答。
+数据库访问仅用于读取向量/文本上下文，本服务不保存对话消息或提交业务事务。
 """
 import logging
 import re
@@ -24,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class RAGService:
-    """实现LangChain标准工作流的RAG服务"""
+    """编排检索路由、上下文选择和流式回答。"""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -50,12 +53,16 @@ class RAGService:
 
         logger.info("RAG服务已使用LangChain组件初始化")
 
+    # ---------- 查询增强 ----------
+
     def _enhance_query_for_kb(self, question: str, conversation_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
-        """
-        基于LLM的语义增强：重写查询并提供扩展关键词。
-        返回: { "rewritten_query": str, "expanded_keywords": List[str] }
+        """尝试用 LLM 重写检索查询并生成有限数量的扩展词。
+
+        功能关闭或调用失败时原样返回问题；非 JSON 响应会按字符令牌启发式提取扩展词。
+        返回内容用于提高召回，不代表已经确定用户的真实语义或检索意图。
         """
         try:
+            # 关闭增强时完全跳过额外模型调用，检索继续使用用户原问题。
             if not getattr(settings, "KB_QUERY_ENHANCE_ENABLED", False):
                 return {"rewritten_query": question, "expanded_keywords": []}
 
@@ -92,6 +99,7 @@ class RAGService:
             )
 
             raw = chain.invoke(question)
+            # 模型输出只影响召回查询，不替代最终用户问题；解析失败仍保留原问题。
             rewritten_query = question
             expanded_keywords: List[str] = []
 
@@ -103,13 +111,15 @@ class RAGService:
                 if isinstance(ek, list):
                     expanded_keywords = [str(t).strip() for t in ek if str(t).strip()]
                 elif isinstance(ek, str):
+                    # 兼容模型把数组错误输出为逗号分隔字符串。
                     expanded_keywords = [t.strip() for t in ek.split(',') if t.strip()]
             except Exception:
-                # 备用方案：直接提取令牌
+                # 非 JSON 输出仅提取中英文/数字令牌作为扩展词，不把整段模型回复直接拼入 SQL 查询。
                 terms = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", raw)
                 expanded_keywords = [t.lower() for t in terms if len(t) >= 2]
 
             max_terms = getattr(settings, "KB_QUERY_EXPANSION_MAX_TERMS", 6)
+            # 截断扩展词数量，防止模型输出过多词导致全文查询膨胀。
             if len(expanded_keywords) > max_terms:
                 expanded_keywords = expanded_keywords[:max_terms]
 
@@ -117,6 +127,8 @@ class RAGService:
         except Exception as e:
             logger.warning(f"查询增强失败: {e}")
             return {"rewritten_query": question, "expanded_keywords": []}
+
+    # ---------- 混合检索与融合 ----------
 
     async def _tsvector_search(
         self,
@@ -126,12 +138,11 @@ class RAGService:
         knowledge_base_id: Optional[UUID] = None,
         extra_terms: Optional[List[str]] = None
     ) -> List[tuple]:
-        """
-        基于langchain_pg_embedding.document的PostgreSQL全文检索（tsvector）。
-        - 集合名严格过滤：cmetadata->>'collection_name'
-        - 查询重写为 OR 前缀 tsquery（类似Elasticsearch match：任一词命中即返回）
-        - 对中文/英中混合词保留 ILIKE 后备，提高召回率
-        返回 (LangChainDocument, score) 列表，与向量检索输出格式一致。
+        """只读查询 langchain_pg_embedding，返回全文检索文档和排名分数。
+
+        查询词通过简单正则、停用词和扩展词构造 OR 前缀 tsquery，同时保留原问题的 ILIKE
+        包含匹配；这是一种召回启发式。集合名始终过滤，知识库过滤可选；SQL 或解析失败时
+        记录警告并返回空列表，不影响向量检索分支。
         """
         try:
             # 1) 查询重写：提取英文/数字/中文词元，移除常见问句停用词，构造 OR 前缀 tsquery
@@ -147,7 +158,8 @@ class RAGService:
             # 构造 tsquery
             tsquery_or = " | ".join(f"{t}:*" for t in terms) if terms else None
 
-            # 2) 构建 SQL：优先使用 to_tsquery(simple, :tsq) 的 OR 匹配；保留 ILIKE 兜底
+            # SQL 结构固定，查询词、集合名、知识库 id 和 limit 都通过绑定参数传入。
+            # :tsq 为空时只保留 ILIKE 原问题兜底。
             base_sql = (
                 "SELECT id, document, cmetadata, "
                 "ts_rank_cd(to_tsvector('simple', document), to_tsquery('simple', :tsq)) AS rank "
@@ -172,6 +184,7 @@ class RAGService:
             for r in rows:
                 doc_text = r[1]
                 metadata = r[2] or {}
+                # 将数据库行恢复为与向量检索相同的 LangChainDocument + score 形状，便于后续统一融合。
                 page_content = doc_text
                 lc_doc = LangChainDocument(page_content=page_content, metadata=metadata)
                 results.append((lc_doc, float(r[3]) if r[3] is not None else 0.0))
@@ -188,21 +201,23 @@ class RAGService:
         top_k: int = 5,
         min_similarity_score: float = 0.2
     ) -> (List[LangChainDocument], List[Dict[str, Any]]):
-        """
-        使用可配置的融合方法合并向量内容结果和PostgreSQL tsvector结果。
-        支持RRF（倒数排名融合）和加权和方法，可选择重排。
+        """按文档和块索引去重，使用配置权重融合向量分数与全文分数。
+
+        融合后按阈值过滤并截取 top_k，配置启用时再调用重排服务。融合或重排任一环节异常
+        会退回原始向量结果的前 top_k，此回退不再应用融合阈值或全文结果。
         """
         try:
             merged_map: Dict[tuple, Dict[str, Any]] = {}
 
-            # 收集向量搜索结果
+            # 以 document_id + chunk_index 识别同一文档块，使向量和全文两路命中合并为一项。
+            # 若元数据同时缺少这两个字段，多个缺失项会共享 (None, None) 键并互相覆盖。
             for doc, score in content_results:
                 key = (doc.metadata.get("document_id"), doc.metadata.get("chunk_index"))
                 merged_map[key] = merged_map.get(key, {"doc": doc, "content_score": 0.0})
                 merged_map[key]["doc"] = doc
                 merged_map[key]["content_score"] = float(score)
 
-            # 集成tsvector文本搜索结果
+            # 全文命中补充 text_score；只被全文命中的块会以 content_score=0 加入。
             for doc, score in text_results:
                 key = (doc.metadata.get("document_id"), doc.metadata.get("chunk_index"))
                 entry = merged_map.get(key, {"doc": doc, "content_score": 0.0})
@@ -210,21 +225,19 @@ class RAGService:
                 entry["text_score"] = float(score)
                 merged_map[key] = entry
 
-            # 合并分数：优先考虑向量相似性，然后是关键词匹配
+            # 两路分数按配置权重直接线性组合；这里假设向量相关度和 ts_rank 分数可按当前权重比较。
             combined_list: List[tuple] = []
             for key, entry in merged_map.items():
                 content_score = float(entry.get("content_score", 0.0))
                 text_score = float(entry.get("text_score", 0.0))
-                # 加权组合：使用配置文件中的权重
                 combined_score = (settings.RAG_CONTENT_WEIGHT * content_score + 
                                 settings.RAG_TEXT_WEIGHT * text_score)
                 combined_list.append((entry["doc"], combined_score, entry))
 
-            # 按combined_score降序排序（更高相关性优先）
+            # 先排序再按最低相关度过滤，最后截取 top_k，低分块不会进入提示词上下文。
             combined_list.sort(key=lambda x: x[1], reverse=True)
             combined_list = [item for item in combined_list if float(item[1]) >= min_similarity_score]
 
-            # 构建输出
             top = combined_list[:top_k]
             docs: List[LangChainDocument] = []
             sources: List[Dict[str, Any]] = []
@@ -244,7 +257,7 @@ class RAGService:
                     "metadata": doc.metadata
                 })
 
-            # 如果启用则应用重排
+            # 重排是融合后的可选第二阶段；服务可根据 query 重新调整顺序和截断结果。
             if settings.RERANK_ENABLED and self.rerank_service.is_enabled():
                 docs, sources = await self.rerank_service.rerank_documents(
                     query=query,
@@ -278,8 +291,14 @@ class RAGService:
                 })
             return docs, sources
 
+    # ---------- 链构造 ----------
+
     def _create_rag_chain_with_docs(self, docs: List[LangChainDocument], conversation_history: List[Dict[str, str]]):
-        """创建带预检索文档的RAG链。"""
+        """把已经检索出的文档和对话历史绑定到回答链。
+
+        本方法不再检索或访问数据库；上下文在链构造时捕获，真正的远程 LLM 调用发生在
+        后续 invoke/astream 阶段。
+        """
         from langchain_core.messages import HumanMessage, AIMessage
         
         # 转换对话历史格式
@@ -323,9 +342,13 @@ class RAGService:
 
         return rag_chain
 
+    # ---------- 流式问答与上下文 ----------
+
     def _should_use_knowledge_base(self, question: str) -> bool:
-        """决定用户问题是否应使用知识库检索。
-        如果返回True则应使用KB，否则返回False。
+        """用关键词和 LLM 输出启发式选择知识库或普通对话路径。
+
+        精确命中少量闲聊词时直接返回 False；其他问题依赖模型输出，无法识别或调用异常时
+        默认返回 True。该结果只是路由选择，不是确定的语义分类。
         """
         try:
             # 先做关键词预筛：纯闲聊关键词直接走 GENERAL，避免浪费 LLM 调用
@@ -371,7 +394,7 @@ class RAGService:
             return True
 
     def _create_general_chat_chain(self, conversation_history: List[Dict[str, str]]):
-        """不带KB上下文的通用聊天链。"""
+        """构造不读取知识库上下文的普通对话链。"""
         from langchain_core.messages import HumanMessage, AIMessage
         
         # 转换对话历史格式
@@ -410,8 +433,14 @@ class RAGService:
         conversation_history: Optional[List[Dict[str, str]]] = None,
         context_limit: int = settings.CONTEXT_LIMIT
     ):
-        """
-        使用RAG工作流进行流式响应的问题提问
+        """按启发式路由执行普通对话或 RAG 流式问答。
+
+        普通路径不检索；知识库路径可先增强查询，再读取 PGVector 向量结果和 PostgreSQL
+        全文结果，融合/重排后构造 RAG 链。即使传入 knowledge_base_id，当前代码也不会
+        强制覆盖路由判断；没有相关文档时回退普通对话。数据库操作均为只读且没有 commit。
+
+        普通对话或无文档回退的生成异常会发送 error 后结束；RAG 生成异常会发送 error，
+        随后仍按现有流程发送 end。更外层的检索或构链异常只发送 error。
 
         Args:
             question: 用户问题
@@ -426,7 +455,7 @@ class RAGService:
         try:
             conversation_history = conversation_history or []
 
-            # 首先进行意图检测
+            # 1. 启发式选择普通对话或知识库路径。
             use_kb = self._should_use_knowledge_base(question)
             print('use_kb=======', use_kb)
             # 如果提供了特定的知识库，总是使用KB检索
@@ -468,7 +497,7 @@ class RAGService:
                     yield {"type": "error", "error": str(e)}
                 return
             print('conversation_history =======', conversation_history)
-            # 可选地为KB检索增强查询
+            # 2. 知识库路径可选增强查询，再执行向量和全文两路只读检索。
             enhance = self._enhance_query_for_kb(question, conversation_history)
             print('enhance=======', enhance)
             rewritten_query = enhance.get("rewritten_query", question)
@@ -476,10 +505,10 @@ class RAGService:
             expanded_keywords = enhance.get("expanded_keywords", [])
             print('expanded_keywords=======', expanded_keywords)
 
-            # 为用户的文档创建集合名称（仅块）
+            # 用户 id 编入集合名，先把向量检索限制到该用户的分块集合。
             collection_name = f"document_chunks_{user_id}".replace("-", "_")
 
-            # 连接到向量存储
+            # PGVector 使用同一嵌入模型把重写查询转向量；这里只建立集合访问对象。
             vector_store = PGVector(
                 connection=self.connection_string,
                 embeddings=self.embeddings,
@@ -488,18 +517,17 @@ class RAGService:
             )
             # 关键词存储已移除；仅保留块向量存储
 
-            # 构建过滤条件
+            # 可选知识库 id 在用户集合范围内继续过滤，不能扩大到其他用户集合。
             filter_conditions = {}
             if knowledge_base_id:
                 filter_conditions["knowledge_base_id"] = str(knowledge_base_id)
 
-            # 多路径检索：内容（向量）+ 文本（tsvector）
-            # 向量路径
+            # 第一条路径执行语义向量检索。该 LangChain API 是同步方法，当前直接在异步生成器中调用。
             content_results = vector_store.similarity_search_with_relevance_scores(
                 rewritten_query, k=context_limit, filter=filter_conditions if filter_conditions else None
             )
 
-            # 第二路径：在块集合上进行PostgreSQL tsvector全文检索
+            # 第二条路径使用原始问题做 PostgreSQL 全文检索，并加入模型生成的扩展词提高召回。
             text_results = await self._tsvector_search(
                 collection_name,
                 question,
@@ -519,7 +547,7 @@ class RAGService:
             #     logger.info(f"文本结果 {i+1}: 分数={score:.4f}, 文档ID={doc.metadata.get('document_id')}, 块索引={doc.metadata.get('chunk_index')}")
             #     logger.info(f"内容预览: {doc.page_content[:200]}...")
 
-            # 合并并选择最终文档和来源
+            # 3. 加权融合并可选重排；无结果时退回普通对话链。
             relevant_docs, sources = await self._merge_docs_with_scores(
                 content_results,
                 text_results,
@@ -575,7 +603,7 @@ class RAGService:
                 "num_sources": len(sources)
             }
 
-            # 使用预检索文档创建RAG链（无额外检索）
+            # 4. 使用已选上下文构链并流式输出，不再执行额外检索。
             rag_chain = self._create_rag_chain_with_docs(relevant_docs, conversation_history)
 
             # 流式传输LLM的响应
@@ -621,8 +649,10 @@ class RAGService:
         conversation_history: List[Dict[str, str]],
         max_messages: int = 10
     ) -> List[Dict[str, str]]:
-        """
-        处理对话历史以获取上下文
+        """截取最近消息并转换角色名称，不访问数据库或远程服务。
+
+        只保留 user/assistant 两类消息，其他角色会被忽略；返回列表是内存中的新结构，
+        不会保存或修改原始对话记录。
 
         Args:
             conversation_history: 对话消息列表

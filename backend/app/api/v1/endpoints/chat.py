@@ -1,5 +1,9 @@
 """
-HR Agent AI交互的聊天端点
+HR Agent 的聊天 API 端点。
+
+普通请求依次完成身份认证、获取或创建会话、调用 ``ChatService`` 处理消息，最后
+返回模型响应。流式接口复用同一业务服务，只是通过异步生成器逐块输出 SSE 数据，
+因此 HTTP 传输方式与 AI 处理逻辑彼此分离。
 """
 from typing import Any, List
 from fastapi import APIRouter, Depends, HTTPException
@@ -24,12 +28,15 @@ async def send_message(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    向HR Agent发送消息并获取响应
+    """完成认证会话恢复/创建，再执行非流式聊天链。
+
+    ``get_or_create_conversation`` 用认证用户限制已有会话归属；随后服务层分别保存用户消息和
+    助手消息，并可按请求开关检索该用户文档。HTTPException 保留原状态，其他错误统一为 500。
     """
     chat_service = ChatService(db)
     
     try:
+        # 先得到已校验所有权的 ORM 会话，后续底层消息方法本身不再接收 user_id。
         conversation = await chat_service.get_or_create_conversation(
             chat_request, current_user
         )
@@ -55,8 +62,10 @@ async def stream_message(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    发送消息并获取流式响应
+    """校验会话后，把聊天服务的 JSON 字符串块包装成 SSE data 帧。
+
+    流式服务会先提交用户消息，正常结束后才保存完整助手消息；远程异常以服务生成的 error
+    JSON 继续输出。响应使用 ``text/plain``，但正文格式遵循 ``data: ...`` 的 SSE 风格。
     """
     chat_service = ChatService(db)
     
@@ -92,8 +101,10 @@ async def get_suggestions(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> List[str]:
-    """
-    获取AI驱动的用户查询建议
+    """为认证用户生成最多五条后续问题建议。
+
+    服务层可结合该用户最近文档摘要构造上下文，再调用 LLM；建议解析或模型异常由服务层
+    降级为空列表，端点保持稳定的字符串数组响应。
     """
     chat_service = ChatService(db)
     
@@ -115,8 +126,10 @@ async def submit_feedback(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """
-    提交聊天消息的反馈
+    """为当前用户拥有的一条聊天消息提交评分和文字反馈。
+
+    服务层把 ``message_id`` 规范化后校验消息所属会话及用户归属，再更新反馈字段；请求中的
+    用户 ID 不可覆盖认证上下文，失败通过聊天服务统一转换为 HTTP 错误。
     """
     chat_service = ChatService(db)
     

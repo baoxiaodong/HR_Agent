@@ -1,6 +1,8 @@
 """
-试卷相关服务
-处理试卷生成和提交的核心业务逻辑
+考试领域服务。
+
+覆盖试卷管理、知识文档驱动的生成与解析、答卷提交评分和结果导出。
+生成、解析和保存是分开的调用阶段，其中试卷主记录与题目使用两次数据库提交。
 """
 from typing import Any, Optional, Dict, List
 import json
@@ -19,11 +21,13 @@ from app.core.logging import logger
 from app.services.kb_selection_service import KBSelectionService
 
 class ExamService:
-    """试卷服务类"""
+    """编排试卷生成、持久化、评分和结果查询。"""
 
     def __init__(self, db: AsyncSession):
         self.db = db
         self.dify_service = DifyService()
+
+    # ---------- 试卷管理 ----------
 
     async def get_exam_list(
         self,
@@ -43,10 +47,11 @@ class ExamService:
             包含试卷列表和分页信息的字典
         """
         try:
-            # 构建查询
+            # 当前方法没有 user_id 参数，查询的是全局试卷列表；访问范围必须由端点权限控制。
+            # selectinload 在同一查询流程预加载题目，避免循环中逐张试卷触发额外懒加载。
             query = select(Exam).options(selectinload(Exam.questions))
 
-            # 应用搜索过滤
+            # 标题、科目和描述共享同一个模糊搜索条件。
             if search:
                 search_filter = or_(
                     Exam.title.ilike(f"%{search}%"),
@@ -55,7 +60,7 @@ class ExamService:
                 )
                 query = query.where(search_filter)
 
-            # 获取总数
+            # count 使用与实体查询相同的 search_filter，但在加分页前计算，因此 total 是全部匹配数。
             count_query = select(func.count(Exam.id))
             if search:
                 count_query = count_query.where(search_filter)
@@ -106,8 +111,10 @@ class ExamService:
         exam_data: Dict[str, Any],
         user_id: str
     ) -> Dict[str, Any]:
-        """
-        保存试卷到数据库
+        """解析可选题目内容，并将试卷主记录和结构化题目分阶段保存。
+
+        主记录先提交以获得试卷 ID，题目随后在第二次提交中保存。第二阶段失败时，回滚不会
+        撤销已经提交的主记录，因此数据库中可能保留没有完整题目的试卷。
 
         Args:
             exam_data: 试卷数据
@@ -137,12 +144,12 @@ class ExamService:
                 updated_by=user_id
             )
 
-            # 保存到数据库
+            # 第一阶段先提交试卷主记录。
             self.db.add(exam)
             await self.db.commit()
             await self.db.refresh(exam)
 
-            # 保存结构化试题数据
+            # 第二阶段保存题目；失败时第一阶段提交的主记录仍然存在。
             if exam_data.get('questions'):
                 for question_data in exam_data['questions']:
                     question = Question(
@@ -351,6 +358,7 @@ class ExamService:
             return updated_exam
 
         except Exception as e:
+            # 只能回滚最近未提交的阶段，前面主字段提交或旧题删除提交均无法撤销。
             await self.db.rollback()
             logger.error(f"更新试卷时出错: {str(e)}")
             raise
@@ -369,7 +377,7 @@ class ExamService:
             删除结果信息
         """
         try:
-            # 查找试卷
+            # 仅按 paper_id 定位，没有用户归属条件；调用端负责删除权限。
             result = await self.db.execute(
                 select(Exam).where(Exam.id == paper_id)
             )
@@ -404,7 +412,7 @@ class ExamService:
             试卷信息
         """
         try:
-            # 查找试卷及其关联的试题
+            # 分享接口按设计不要求认证，因此只凭 paper_id 读取；持有链接即可访问试卷题面。
             result = await self.db.execute(
                 select(Exam)
                 .options(selectinload(Exam.questions))
@@ -575,6 +583,8 @@ class ExamService:
             logger.error(f"获取考试结果详情时出错: {str(e)}")
             raise
 
+    # ---------- 生成与解析 ----------
+
     async def generate_exam(
         self,
         title: str,
@@ -591,8 +601,12 @@ class ExamService:
         conversation_id: Optional[str] = None,
         stream: bool = True
     ) -> Any:
-        """
-        生成试卷
+        """准备知识内容和分值配置，并调用 Dify 生成试卷文本。
+
+        未指定文档时会尝试自动选择知识库文档；选择或读取单个文档失败仅记录日志，仍可能
+        使用占位内容继续生成。分值按题型权重预先计算并传给工作流，但本方法不解析响应、
+        不创建试卷记录；解析和两阶段持久化由后续 ``_parse_exam_content``/``save_exam`` 完成。
+        流式模式返回生成器，远程请求在调用方开始迭代后才执行。
 
         Args:
             title: 试卷标题
@@ -613,7 +627,7 @@ class ExamService:
             试卷生成结果
         """
         try:
-            # 初始化文档服务
+            # 1. 准备知识文件：可自动选择，逐个读取失败时跳过。
             document_service = EnhancedDocumentService(self.db)
 
             # 若未提供知识库文档，自动选择最匹配文档
@@ -676,10 +690,10 @@ class ExamService:
                 logger.warning("没有可用的文档内容用于生成试卷")
                 combined_content = "未提供文档内容"
 
-            # 分值分配算法（按 2:3:5 权重，并将剩余分数依次分配给最后几题）
+            # 2. 预分配题目分值，并连同题量要求写入工作流输入。
             question_scores = self._allocate_question_scores(total_score, question_counts or {})
 
-            # 构建试卷生成查询
+            # 3. 组装生成提示；面试方案上下文会调整题目来源配比。
             has_interview_plan_context = bool(
                 special_requirements
                 and ("当前面试方案" in special_requirements or "面试方案" in special_requirements)
@@ -831,7 +845,7 @@ class ExamService:
                 }
             
             if stream:
-                # 流式响应
+                # 4. 流式分支只返回生成器；Dify 异常会在迭代期间传播。
                 async def generate_stream():
                     async for chunk in self.dify_service.call_workflow_stream(
                         workflow_type=5,  # 使用类型5进行试卷生成
@@ -844,7 +858,7 @@ class ExamService:
 
                 return generate_stream()
             else:
-                # 同步响应
+                # 非流式分支在此等待远程工作流结果，仍不解析或写数据库。
                 result = await self.dify_service.call_workflow_sync(
                     workflow_type=5,
                     query=query,
@@ -864,6 +878,11 @@ class ExamService:
         return sum(int(question_counts.get(key) or 0) for key in keys)
 
     def _parse_exam_content(self, content: Optional[str]) -> List[Dict[str, Any]]:
+        """把 Dify 的分隔文本转换为可保存的题目列表。
+
+        仅接收恰好包含 6 个 ``|`` 字段的题块，格式不符的块会被静默跳过；分值只提取首个
+        整数，未匹配时记 0。该解析不校验题型数量、总分或答案语义是否符合生成要求。
+        """
         if not content or not isinstance(content, str):
             return []
 
@@ -899,7 +918,10 @@ class ExamService:
 
     def _allocate_question_scores(self, total_score: int, counts: Dict[str, int]) -> Dict[str, List[int]]:
         """
-        分值分配算法（按 2:3:5 权重，并将剩余分数依次分配给最后几题）
+        按 2:3:5 权重为三种标准题型分配整数分值。
+
+        非正总分或没有受支持题型时返回对应长度的全 0 列表；余数按简答、多选、单选的
+        逆序题目循环加 1。别名题型和额外键不会参与本方法的分值计算。
 
         Args:
             total_score: 总分
@@ -970,6 +992,8 @@ class ExamService:
         "short_answer": [15, 16]                # 简答题分值列表
     }'''
 
+    # ---------- 提交评分与导出 ----------
+
     async def submit_exam(
         self,
         exam_id: str,
@@ -978,8 +1002,12 @@ class ExamService:
         answers: Dict[str, Any],
         exam_content: str
     ) -> Dict[str, Any]:
-        """
-        提交考试答案并进行自动评分
+        """逐题调用 Dify 评分，并保存一条考试结果记录。
+
+        ``exam_content`` 会先做 JSON 解析，但评分依据来自数据库中的试卷和题目。单题远程调用
+        或得分解析失败时该题记 0 分并继续，最终仍可形成部分成功的评分结果；所有题目完成后
+        只提交一次结果记录。异常处理仅记录并重新抛出，没有显式回滚数据库会话，已完成的
+        远程评分调用也不可回滚。
 
         Args:
             exam_id: 试卷ID
@@ -1027,7 +1055,7 @@ class ExamService:
                 }
                 questions_with_answers.append(question_info)
 
-            # 逐题调用Dify进行评分，避免一次性提交过多内容
+            # 逐题调用 Dify；单题失败不终止后续题目。
             questions_with_scores = []
             per_question_results = []
             total_score = 0.0
@@ -1135,7 +1163,7 @@ class ExamService:
 
             self.db.add(exam_result)
 
-            # 提交数据库事务
+            # 评分汇总完成后一次性提交结果记录。
             await self.db.commit()
 
             logger.info(f"考试提交并保存成功，考生: {student_name}, 考试结果ID: {exam_result.id}")

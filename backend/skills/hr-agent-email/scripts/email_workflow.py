@@ -1,3 +1,12 @@
+"""
+``hr-agent-email`` Skill 的草稿与确认发送阶段实现。
+
+``agent_skills.py`` 以 ``context`` 字典注入 LLM、邮件服务、认证用户及确认数据，本脚本则
+返回统一的 ``message/steps/artifacts/requires_confirmation`` 结构供 Agent 展示和续跑。
+草稿阶段绝不直接发送：模型失败时退回本地模板；只有用户确认后的 send phase 才调用邮件
+服务，SMTP 接受请求也不代表收件方最终投递成功。
+"""
+
 import re
 
 
@@ -5,6 +14,7 @@ EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def _fallback_draft() -> str:
+    """返回不含虚构时间地点的本地兜底草稿。"""
     return (
         "主题：【待补充岗位】面试/考试通知\n\n"
         "候选人您好，\n\n"
@@ -16,6 +26,11 @@ def _fallback_draft() -> str:
 
 
 def _build_send_request(user_text: str, draft_text: str, confirmation_action: str) -> dict[str, str]:
+    """把自由文本草稿收敛为等待人工确认的结构化发送请求。
+
+    收件人只从用户原始需求中按正则提取，主题从草稿首个主题行提取；缺失值保留为空或
+    占位符，不在此阶段猜测。返回结构会作为 artifact 传回 Agent，而不是立即调用 SMTP。
+    """
     recipient_email = ""
     email_match = EMAIL_PATTERN.search(user_text or "")
     if email_match:
@@ -41,6 +56,12 @@ def _build_send_request(user_text: str, draft_text: str, confirmation_action: st
 
 
 async def run_draft_phase(context: dict) -> dict:
+    """生成可编辑草稿，并把下一阶段标记为等待人工确认。
+
+    ``draft_text`` 可覆盖模型生成，便于用户修改后重入；否则使用注入的 LLM 服务，未注入
+    时才自行创建。任何生成异常都会降级到本地模板，但仍通过 ``missing_fields`` 明确提示
+    收件人等必填数据。
+    """
     llm_service = context.get("llm_service")
     message = context.get("message", "")
     memory_context = context.get("memory_context", "")
@@ -93,6 +114,12 @@ async def run_draft_phase(context: dict) -> dict:
 
 
 async def run_send_phase(context: dict) -> dict:
+    """校验确认载荷并通过邮件服务提交发送请求。
+
+    ``confirmed_requirements`` 是草稿阶段 artifact 经用户确认后的结构；认证 ``user_id``
+    继续传给邮件服务，用于选择当前用户可用的发件配置。服务抛出的 ``ValueError`` 会变成
+    可重试的 failed step，成功结果则只承诺 SMTP 已接受提交。
+    """
     payload = context.get("confirmed_requirements") or {}
     email_service = context.get("email_service")
     user_id = context.get("user_id")

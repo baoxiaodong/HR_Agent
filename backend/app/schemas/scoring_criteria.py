@@ -1,5 +1,9 @@
 """
-    评分标准API请求/响应验证的Schema定义
+简历评分标准生成、持久化和分页响应 Schema。
+
+生成请求携带 JD 原文及职位要求，Create/Update 模型描述可保存字段，Response 模型补充
+远程资源的 ID、用户、工作流和审计信息。``scoring_dimensions`` 保留为字典列表，以兼容
+模型生成的不同评分维度结构。
 """
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -10,14 +14,20 @@ from app.models.scoring_status import ScoringStatus
 
 
 class ScoringCriteriaBase(BaseModel):
-    """评分标准基础Schema"""
+    """评分标准正文、结构化维度和来源上下文的共用字段。"""
+
+    # 用户可读内容
     title: str
     job_title: Optional[str] = None
     content: str
+
+    # AI 生成的结构化评分数据
     criteria_data: Optional[Dict[str, Any]] = None
     total_score: Optional[str] = "100"
     scoring_dimensions: Optional[List[Dict[str, Any]]] = None
     status: Optional[str] = "draft"
+
+    # 追踪评分标准来自哪个会话、工作流和 JD。
     meta_data: Optional[Dict[str, Any]] = None
     conversation_id: Optional[str] = None
     workflow_type: Optional[str] = "scoring_criteria_generation"
@@ -25,12 +35,12 @@ class ScoringCriteriaBase(BaseModel):
 
 
 class ScoringCriteriaCreate(ScoringCriteriaBase):
-    """创建新评分标准的Schema"""
+    """把生成结果首次保存到远程服务时使用。"""
     pass
 
 
 class ScoringCriteriaUpdate(BaseModel):
-    """更新评分标准的Schema"""
+    """编辑评分标准时的局部字段，未提交项不覆盖旧数据。"""
     title: Optional[str] = Field(None, min_length=1, max_length=255)
     job_title: Optional[str] = Field(None, max_length=255)
     content: Optional[str] = Field(None, min_length=1)
@@ -43,7 +53,7 @@ class ScoringCriteriaUpdate(BaseModel):
 
 
 class ScoringCriteriaInDB(ScoringCriteriaBase):
-    """数据库中评分标准的Schema"""
+    """远程服务持久化后补充资源归属、审计时间和软删除状态。"""
     id: UUID
     user_id: UUID
     workflow_type: str
@@ -56,22 +66,24 @@ class ScoringCriteriaInDB(ScoringCriteriaBase):
 
 
 class ScoringCriteriaResponse(ScoringCriteriaInDB):
-    """评分标准API响应的Schema"""
+    """评分标准详情接口的最终响应结构。"""
     pass
 
 
 class ScoringCriteriaListResponse(BaseModel):
-    """评分标准列表响应的Schema"""
+    """标准分页结构：当前页数据、总数、页码、页大小和总页数。"""
     items: List[ScoringCriteriaResponse]
     total: int
     page: int
     size: int
     pages: int
 
+
 class ScoringCriteriaGenerateRequest(BaseModel):
-    """评分标准生成请求模型"""
-    jd_content: str  # 招聘内容(JD)
-    job_title: Optional[str] = None  # 职位标题
-    requirements: Optional[Dict[str, Any]] = None  # 职位要求
-    conversation_id: Optional[str] = None  # 对话ID
-    stream: bool = True  # 是否流式返回结果
+    """把 JD 内容和要求提交给 Dify 生成评分标准。"""
+
+    jd_content: str  # 评分标准最主要的事实来源
+    job_title: Optional[str] = None
+    requirements: Optional[Dict[str, Any]] = None
+    conversation_id: Optional[str] = None
+    stream: bool = True  # True 返回生成过程，False 等待完整结果

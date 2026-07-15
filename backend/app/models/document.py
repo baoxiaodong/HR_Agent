@@ -1,5 +1,9 @@
 """
-    用于文件管理和向量存储的文档模型
+上传文档及其检索元数据的数据库模型。
+
+一条记录连接磁盘文件、提取后的纯文本、可选文档级向量、上传用户和知识库。用于 RAG 的
+分块向量另存于 LangChain PGVector 表，不由本模型关系管理；删除服务需要同时清理两处
+数据和磁盘文件。
 """
 from sqlalchemy import Column, String, Text, Integer, ForeignKey, JSON, LargeBinary
 from sqlalchemy.dialects.postgresql import UUID

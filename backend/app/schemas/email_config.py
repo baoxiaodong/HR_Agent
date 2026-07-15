@@ -1,5 +1,8 @@
 """
-    招聘邮箱配置和日志的Schema
+招聘邮箱配置、连通性测试、抓取日志和自动评价请求 Schema。
+
+创建请求必须包含密码，更新请求允许空密码表示“不修改”；公开 ``EmailConfig`` 响应不
+声明密码字段。端口、抓取间隔和邮箱格式会在进入服务层前由 Pydantic 校验。
 """
 from datetime import datetime
 from typing import Optional, List

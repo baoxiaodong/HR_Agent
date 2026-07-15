@@ -1,5 +1,9 @@
 """
-知识助手服务层，处理知识库相关的业务逻辑
+知识助手用例的门面服务。
+
+它把 API 层与文档查询、RAG 问答隔开：配置和文档列表走轻量服务，问题则在规范化知识库
+UUID 后委托 ``RAGService`` 流式生成。这里统一产出事件字典，SSE 字符串编码和会话消息
+持久化由端点层负责。
 """
 import json
 import logging
@@ -19,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class KnowledgeAssistantService:
-    """知识助手服务类，处理所有知识库相关的业务逻辑"""
+    """在轻量文档查询与 RAG 流式问答之上提供稳定的 API 用例边界。"""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -28,11 +32,10 @@ class KnowledgeAssistantService:
         self.rag_service = RAGService(db)
 
     async def get_config(self) -> Dict[str, Any]:
-        """
-        获取知识助手配置信息
-        
-        Returns:
-            Dict: 配置信息字典
+        """返回前端可见的知识助手运行限制。
+
+        配置直接来自进程设置，不读取数据库，也不会暴露模型密钥、服务地址等内部配置。
+        当前仅公开 ``CONTEXT_LIMIT``，由端点作为稳定 JSON 字段返回。
         """
         logger.info("获取知识助手配置")
         return {
@@ -48,26 +51,16 @@ class KnowledgeAssistantService:
         context_limit: int = 10,
         conversation_history: Optional[List[Dict]] = None
     ):
-        """
-        向知识助手提问，使用RAG工作流生成流式响应
-        
-        Args:
-            question: 问题
-            user_id: 用户ID
-            knowledge_base_id: 知识库ID（可选）
-            context_limit: 上下文限制
-            conversation_history: 对话历史（可选）
-            
-        Yields:
-            Dict: 流式响应数据块
-            
-        Raises:
-            Exception: 生成答案时发生错误
+        """规范化知识库过滤器后，转发 RAG 流式事件。
+
+        ``user_id`` 应来自认证用户。知识库 ID 非法时当前实现降级为 ``None``，查询范围会从
+        “指定知识库”扩大为“该用户全部可检索文档”，但仍由 RAG 服务按用户隔离。会话历史
+        只作为生成上下文，不作为权限依据。异常转换为单个 error 事件，不向上抛出。
         """
         logger.info(f"用户 {user_id} 提问: {question}")
         
         try:
-            # 转换知识库ID从字符串到UUID（如果提供）
+            # RAG 层接收 UUID；非法字符串被视为未指定过滤器，而不是 400。
             kb_id = None
             if knowledge_base_id:
                 try:
@@ -76,10 +69,10 @@ class KnowledgeAssistantService:
                     logger.warning(f"无效的知识库ID格式: {knowledge_base_id}")
                     pass  # 如果UUID无效则使用None
             
-            # 解析对话历史
+            # 历史沿用 API 传入的 role/content 字典；空值统一为无历史。
             conv_history = conversation_history or []
             
-            # 使用RAG服务生成流式答案
+            # RAG 服务负责检索、重排和模型回答，本门面不保存会话或提交事务。
             async for chunk in self.rag_service.ask_question_stream(
                 question=question,
                 user_id=user_id,
@@ -104,26 +97,16 @@ class KnowledgeAssistantService:
         skip: int = 0,
         limit: int = 20
     ) -> Dict[str, Any]:
-        """
-        获取知识库中的文档列表（性能优化版本）
-        
-        Args:
-            user_id: 用户ID
-            knowledge_base_id: 知识库ID（可选）
-            skip: 跳过的文档数量
-            limit: 返回的文档数量限制
-            
-        Returns:
-            Dict: 包含文档列表和总数的字典
-            
-        Raises:
-            HTTPException: 知识库ID格式无效时抛出异常
-            Exception: 获取文档失败时抛出异常
+        """分页读取当前用户文档并把 ORM 字段转换为 JSON 友好字典。
+
+        指定的知识库 ID 非法时返回 400，与问答流的宽松降级不同。轻量服务的 SQL 始终包含
+        ``user_id``；UUID 和时间转换为字符串，列表空值补为安全默认值。返回的 ``total`` 是
+        本页结果数量，不是满足条件的数据库总数。
         """
         logger.info(f"用户 {user_id} 获取文档列表")
         
         try:
-            # 转换知识库ID从字符串到UUID（如果提供）
+            # 列表接口需要明确过滤语义，因此非法知识库 ID 直接拒绝，不扩大查询范围。
             kb_id = None
             if knowledge_base_id:
                 try:

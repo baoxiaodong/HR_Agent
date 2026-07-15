@@ -1,5 +1,8 @@
 """
-统计相关的API端点
+仪表盘统计 API。
+
+所有接口先认证当前用户，再把用户 ID 和分页/时间范围交给 ``StatsService`` 聚合数据。
+端点层不编写统计 SQL，只负责选择统计场景并将服务异常转换为 500 响应。
 """
 from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -18,8 +21,10 @@ async def get_dashboard_stats(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
-    """
-    获取仪表板统计数据
+    """聚合当前用户的 JD、简历、待面试和会话卡片统计。
+
+    用户 ID 转为字符串后交给服务层；各子统计已在服务内部独立降级，因此通常可返回部分
+    数据，只有组合流程自身异常才由端点映射为 500。
     """
     try:
         stats_service = StatsService(db)
@@ -38,8 +43,10 @@ async def get_recruitment_trend(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
-    """
-    获取招聘趋势数据
+    """返回当前用户在指定天数窗口内的远程 JD 趋势序列。
+
+    ``days`` 当前没有 Query 上下界，由服务原样传给远程统计接口；远程失败在服务层降级为
+    空 ``dates/counts``，端点只处理未被吸收的异常。
     """
     try:
         stats_service = StatsService(db)
@@ -57,8 +64,10 @@ async def get_training_completion_stats(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
-    """
-    获取简历评价分布统计
+    """统计当前用户简历评价的高、中、低分占比。
+
+    聚合 SQL 和空集合/查询失败的降级口径由服务层维护；端点只提供认证用户范围并返回固定
+    三字段结构。
     """
     try:
         stats_service = StatsService(db)
@@ -78,8 +87,10 @@ async def get_recent_activities(
     current_user: UserSchema = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
-    """
-    获取最近活动记录（支持分页）
+    """合并当前用户的远程 JD、本地简历和会话活动后分页返回。
+
+    ``limit``、``offset`` 由 Query 限制；服务层先归一化各来源、按时间排序，再对合并结果
+    切片，单个来源失败不会清空其他活动。
     """
     try:
         stats_service = StatsService(db)

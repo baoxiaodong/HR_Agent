@@ -1,8 +1,12 @@
+"""
+招聘邮箱配置、抓取与发送服务。
+
+``EmailConfigService`` 管理 IMAP/SMTP 配置，``EmailFetchService`` 扫描邮件附件并触发简历
+评价，``EmailSendService`` 根据 Skill 配置生成或发送通知。数据库、文件下载和外部邮件
+服务器不共享事务，因此各流程会分别记录成功或失败状态。
+"""
 from __future__ import annotations
 
-"""
-招聘邮箱配置和操作的服务层
-"""
 import smtplib
 import logging
 from dataclasses import dataclass
@@ -55,6 +59,8 @@ class SkillMailConfig:
 
 
 class EmailConfigService:
+    """管理邮箱配置记录和 IMAP 连通性状态。"""
+
     def __init__(self, db: AsyncSession):
         self.db = db
 
@@ -72,6 +78,8 @@ class EmailConfigService:
 
     async def create(self, data: EmailConfigCreate,create_by: UUID) -> EmailConfig:
         EmailConfig = _email_config_model()
+        # 请求 Schema 映射到 ORM；created_by/updated_by 由当前登录用户注入，不能由请求正文伪造。
+        # password 当前按模型字段直接保存，后续连接时会取出使用，并非密码哈希登录场景。
         config = EmailConfig(
             name=data.name,
             email=data.email,
@@ -91,19 +99,23 @@ class EmailConfigService:
             updated_by = create_by
         )
         self.db.add(config)
+        # flush 先把 INSERT 发送给数据库，commit 才正式提交；refresh 再读取数据库默认字段。
         await self.db.flush()
         await self.db.commit()
         await self.db.refresh(config)
         return config
 
     async def update(self, config: EmailConfig, data: EmailConfigUpdate) -> EmailConfig:
+        # 只修改请求中实际出现的字段；空密码表示“保留原密码”，而不是清空凭据。
         update_data = data.model_dump(exclude_unset=True)
-        # 避免设置空密码
         if "password" in update_data and not update_data.get("password"):
             update_data.pop("password")
+
+        # 在已加载 ORM 对象上逐字段赋值，由 SQLAlchemy 脏检查生成 UPDATE。
         for k, v in update_data.items():
             setattr(config, k, v)
         await self.db.commit()
+        # commit 后再 flush 通常已无待发送变更；refresh 用数据库最终值覆盖当前对象状态。
         await self.db.flush()
         await self.db.refresh(config)
         return config
@@ -114,6 +126,7 @@ class EmailConfigService:
         await self.db.flush()
 
     async def test_connection(self, config: EmailConfig, password: Optional[str] = None) -> bool:
+        # 编辑页面可传尚未保存的新密码进行测试；未传时才回退数据库现有密码。
         reader_cfg = ReaderConfig(
             host=config.imap_server,
             port=config.imap_port,
@@ -123,19 +136,30 @@ class EmailConfigService:
             protocol="IMAP",
         )
         reader = EmailReader(reader_cfg)
+        # EmailReader.connect/disconnect 是同步调用，当前会短暂阻塞异步事件循环。
         ok = reader.connect()
         reader.disconnect()
         config.connection_status = "connected" if ok else "error"
+        # 这里只 flush 连接状态，不 commit；调用端负责决定是否与当前请求的其他修改一起提交。
         await self.db.flush()
         return ok
 
 
 class EmailFetchService:
+    """扫描招聘邮箱，并在定时抓取路径中下载附件和触发简历评价。"""
+
     def __init__(self, db: AsyncSession):
         self.db = db
 
     async def manual_fetch(self, config: EmailConfig) -> EmailFetchLog:
+        """连接邮箱并统计最近邮件中的简历附件，不下载附件或执行自动评价。
+
+        抓取日志先加入会话并 ``flush``，随后根据连接、扫描结果更新日志和配置状态；本方法
+        不 ``commit``，当前 API 调用方会在返回后统一提交。连接失败和扫描异常都以 failed
+        日志返回，邮箱连接始终在 finally 中关闭。
+        """
         EmailFetchLog = _email_fetch_log_model()
+        # 先建立 running 日志并 flush 取得 id；尚未 commit，连接结果会继续更新同一事务中的记录。
         log = EmailFetchLog(email_config_id=config.id, status="running")
         self.db.add(log)
         await self.db.flush()
@@ -155,7 +179,7 @@ class EmailFetchService:
                 log.error_message = "无法连接到邮箱服务器"
                 return log
 
-            # 选择收件箱并获取最近50封邮件
+            # search 返回整个收件箱的邮件 id，因此 emails_found 记录总数；实际只扫描最新 50 封。
             reader.select_folder("INBOX")
             ids = reader.search_emails(["ALL"]) or []
             log.emails_found = len(ids)
@@ -166,6 +190,7 @@ class EmailFetchService:
                 msg = reader.get_email(msg_id)
                 if not msg:
                     continue
+                # 手动抓取只按扩展名计数，不下载附件，也不验证附件内容能否被简历解析器读取。
                 for att in msg.attachments:
                     filename = (att.get("filename") or "").lower()
                     if filename.endswith((".pdf", ".doc", ".docx")):
@@ -177,11 +202,13 @@ class EmailFetchService:
             config.connection_status = "connected"
             return log
         except Exception as e:
+            # 把扫描异常写入业务日志对象而不是向上抛出；外层仍需 commit 才能持久化失败状态。
             log.status = "failed"
             log.error_message = str(e)
             config.connection_status = "error"
             return log
         finally:
+            # 成功、失败和提前 return 都会经过 finally，避免 IMAP 连接泄漏。
             reader.disconnect()
 
     async def list_logs(self, config_id: str, skip: int = 0, limit: int = 100) -> List[EmailFetchLog]:
@@ -204,14 +231,20 @@ class EmailFetchService:
         subject_keyword: list = None,
         output_dir: Optional[Path] = None,
     ) -> EmailFetchLog:
-        """
-        获取最近的邮件并在主题包含关键词时下载附件。
+        """筛选最近邮件，下载附件，并尽力触发自动简历评价。
+
+        日志仅先 ``flush``，最终由调度调用方提交；主题过滤后，以邮件 ID 是否已有评价记录
+        作为去重条件。当前不按附件扩展名过滤，任意非空附件都会先写入文件系统并计数，再
+        调用评价服务；评价或单个附件失败会被记录并继续，因此成功日志可能包含已保存但未
+        评价的附件。评价服务可在循环中独立提交记录，后续日志提交失败也不会回滚已落盘
+        文件或已提交评价。
         """
         EmailFetchLog = _email_fetch_log_model()
         log = EmailFetchLog(email_config_id=config.id, status="running")
         self.db.add(log)
         await self.db.flush()
 
+        # 默认按触发用户分目录保存附件。目录创建失败被吸收，真正写文件时会按单附件失败处理。
         base_dir = output_dir or (Path(__file__).resolve().parent.parent.parent / "uploads" / "email_attachments" / str(create_by))
         try:
             os.makedirs(base_dir, exist_ok=True)
@@ -260,11 +293,15 @@ class EmailFetchService:
                 logger.info("发现符合条件的邮件: %s (ID: %s)", subject, msg_id)
 
                 for att in (msg.attachments or []):
+                    # filename 直接来自邮件附件；当前路径拼接没有先取 Path(fname).name，
+                    # 因而这里尚未像上传接口那样完成目录信息净化。
                     fname = att.get("filename") or "attachment"
                     content = att.get("content")
                     if not content:
                         continue
                     logger.debug("处理附件: %s", fname)
+                    # 去重粒度是邮件 id 而不是单个附件：只要该邮件已有一条评价，当前邮件其余附件也会跳过。
+                    # 查询失败时仍继续处理，不能视为已经确认附件未处理。
                     try:
                         ResumeEvaluation = _resume_evaluation_model()
                         existing = await self.db.execute(select(ResumeEvaluation).where(ResumeEvaluation.email_id == str(msg_id)))
@@ -282,6 +319,7 @@ class EmailFetchService:
                         suffix = target_path.suffix
                         target_path = base_dir / f"{stem}_{idx}{suffix}"
                         idx += 1
+                    # 文件保存成功即计数；后续自动评价失败不会删除该附件。
                     try:
                         with open(target_path, "wb") as f:
                             f.write(content)
@@ -318,6 +356,8 @@ class EmailFetchService:
 
 
 class EmailSendService:
+    """从 Skill 文件读取发送配置，并通过 SMTP 提交单封邮件。"""
+
     def __init__(self, db: AsyncSession):
         self.db = db
         self.config_path = Path(__file__).resolve().parents[2] / "skills" / "hr-agent-email" / "config.txt"
@@ -329,7 +369,17 @@ class EmailSendService:
         subject: str,
         body: str,
     ) -> dict:
+        """加载 Skill 邮箱配置并同步调用 SMTP 发送。
+
+        当前实现直接在异步方法中执行阻塞 SMTP，没有切换到工作线程；配置读取、参数校验、
+        登录、网络或服务器拒收异常都会传播给调用方。返回 submitted 只表示 SMTP 服务器
+        接受了提交，不代表最终投递成功。
+        """
+        # 当前发送配置来自全局 Skill 文件，user_id 未参与账号选择或权限判断；
+        # 调用端必须在进入本服务前确认当前用户允许发送邮件。
         config = self._load_skill_mail_config()
+
+        # 在建立 SMTP 连接前完成最低限度必填校验，避免发送空主题/正文。
         if not recipient_email:
             raise ValueError("缺少收件人邮箱地址。")
         if not subject:
@@ -357,12 +407,14 @@ class EmailSendService:
         }
 
     def _load_skill_mail_config(self) -> SkillMailConfig:
+        # 该配置独立于数据库 EmailConfig，读取的是 skills/hr-agent-email/config.txt。
         if not self.config_path.exists():
             raise ValueError(f"未找到邮箱配置文件：{self.config_path}")
 
         raw: dict[str, str] = {}
         for line in self.config_path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
+            # 忽略空行、注释和不符合 KEY=VALUE 的行；split(..., 1) 允许值本身包含等号。
             if not stripped or stripped.startswith("#") or "=" not in stripped:
                 continue
             key, value = stripped.split("=", 1)
@@ -407,10 +459,13 @@ class EmailSendService:
         message.set_content(body)
 
         if config.use_ssl:
+            # SSL 模式从建连开始加密，通常使用 465 端口。
             with smtplib.SMTP_SSL(config.smtp_server, config.smtp_port or 465, timeout=20) as server:
                 server.login(config.email, config.password or "")
                 return server.send_message(message) or {}
 
+        # 非 SSL 模式先普通连接，再尽力升级 STARTTLS。当前升级失败会被忽略，
+        # 随后仍继续登录和发送，因此是否允许明文降级取决于 SMTP 服务器环境。
         with smtplib.SMTP(config.smtp_server, config.smtp_port or 587, timeout=20) as server:
             server.ehlo()
             try:
